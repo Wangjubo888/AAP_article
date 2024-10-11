@@ -19,6 +19,7 @@ class QNetwork(nn.Module):
         x = torch.relu(self.fc2(x))
         return self.out(x)
 
+
 # 定义经验回放池
 class ReplayMemory:
     def __init__(self, capacity):
@@ -32,6 +33,7 @@ class ReplayMemory:
 
     def __len__(self):
         return len(self.memory)
+
 
 # 定义Agent
 class DQNAgent:
