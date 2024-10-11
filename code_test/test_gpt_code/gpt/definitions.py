@@ -11,29 +11,29 @@ MAX_SPEED = 15.0  # 最大速度，单位：m/s
 MIN_SPEED = 5.0   # 最小速度，单位：m/s
 MAX_ACCELERATION = 5.0  # 最大加速度，单位：m/s²
 SENSING_RANGE = 50.0  # 感知范围，单位：m
-DT = 1.0  # 时间步长，单位：s
+DT = 0.1  # 时间步长，单位：s
 NUM_MOVE = 5  # 每个动作的移动步数
 MAX_EPISODE_LEN = 500  # 最大回合长度
 NUM_DETECTION_SECTORS = 12  # 检测区域划分的扇区数
 RANGE_DETECTION = 50.0  # 检测区域半径，单位：m
-MIN_DISTANCE = 5.0  # 无人机之间的最小安全距离，单位：m
+MIN_DISTANCE = 10.0  # 无人机之间的最小安全距离，单位：m
 
 
 # 定义无人机类
 @dataclass
 class UAV:
     drone_id: int
-    position: Point
-    target: Point
+    position: np.ndarray  # 三维坐标，形状为 (3,)
+    target: np.ndarray  # 三维坐标，形状为 (3,)
     optimal_speed: float  # 最优速度，单位：m/s
     task_type: str  # 'takeoff' 或 'landing'
     cooperative: bool  # 是否为合作无人机
     emergency: bool = False  # 是否为紧急状态
-    max_altitude: float = 100.0  # 最大高度，单位：m
+    max_altitude: float = 1500.0  # 最大高度，单位：m
     min_altitude: float = 0.0    # 最小高度，单位：m
 
     speed: float = field(init=False)
-    heading: float = field(init=False)
+    heading: float = field(init=False)  # 三维方向向量
     altitude: float = field(init=False)
     optimal_path_length: float = field(init=False)
 
@@ -65,10 +65,10 @@ class UAV:
             self.altitude = self.min_altitude  # 起飞任务从最低高度开始
         elif self.task_type == 'landing':
             self.altitude = random.uniform(self.min_altitude, self.max_altitude)
-        else:
-            self.altitude = random.uniform(self.min_altitude, self.max_altitude)
+        # else:
+        #     self.altitude = random.uniform(self.min_altitude, self.max_altitude)
         self.last_altitude = self.altitude
-        self.optimal_path_length = self.position.distance(self.target)
+        self.optimal_path_length = np.linalg.norm(self.position - self.target)
 
     def calculate_bearing(self) -> float:
         """
