@@ -12,29 +12,30 @@ MAX_DRONES = 20  # 最大无人机数量
 MAX_SPEED = 15.0  # 最大速度，单位：m/s
 MIN_SPEED = 5.0   # 最小速度，单位：m/s
 MAX_ACCELERATION = 5.0  # 最大加速度，单位：m/s²
-SENSING_RANGE = 50.0  # 感知范围，单位：m
-DT = 1.0  # 时间步长，单位：s
+SENSING_RANGE = 100.0  # 感知范围，单位：m
+DT = 0.1  # 时间步长，单位：s
 NUM_MOVE = 5  # 每个动作的移动步数
 MAX_EPISODE_LEN = 500  # 最大回合长度
 NUM_DETECTION_SECTORS = 12  # 检测区域划分的扇区数
-RANGE_DETECTION = 50.0  # 检测区域半径，单位：m
+RANGE_DETECTION = 100.0  # 检测区域半径，单位：m
 MIN_DISTANCE = 5.0  # 无人机之间的最小安全距离，单位：m
+
 
 # 定义无人机类
 @dataclass
 class UAV:
     drone_id: int
-    position: Point
-    target: Point
-    optimal_speed: float  # 最优速度，单位：m/s
+    position: np.ndarray
+    target: np.ndarray
     task_type: str  # 'takeoff' 或 'landing'
     cooperative: bool  # 是否为合作无人机
     emergency: bool = False  # 是否为紧急状态
-    max_altitude: float = 100.0  # 最大高度，单位：m
+    max_altitude: float = 1500.0  # 最大高度，单位：m，同样也是研究空域最大高度
     min_altitude: float = 0.0    # 最小高度，单位：m
+    optimal_speed: float = 10.0  # 最优速度，单位：m/s
 
     speed: float = field(init=False)
-    heading: float = field(init=False)
+    heading: float = field(init=False)  # 三维方向向量
     altitude: float = field(init=False)
     optimal_path_length: float = field(init=False)
 
@@ -66,42 +67,36 @@ class UAV:
             self.altitude = self.min_altitude  # 起飞任务从最低高度开始
         elif self.task_type == 'landing':
             self.altitude = random.uniform(self.min_altitude, self.max_altitude)
-        else:
-            self.altitude = random.uniform(self.min_altitude, self.max_altitude)
         self.last_altitude = self.altitude
-        self.optimal_path_length = self.position.distance(self.target)
+        self.optimal_path_length = np.linalg.norm(self.position - self.target)  # 二维直线距离
 
     def calculate_bearing(self) -> float:
         """
         计算当前位姿到目标的航向角
         """
-        dx = self.target.x - self.position.x
-        dy = self.target.y - self.position.y
+        dx = self.target[0] - self.position[0]
+        dy = self.target[1] - self.position[1]
         bearing = math.atan2(dy, dx)
         return bearing % (2 * math.pi)
 
-    def predict_position(self, dt: float = DT) -> Point:
+    def predict_position(self, dt: float = DT) -> np.ndarray:
         """
         预测在 dt 秒后的未来位置，保持当前速度和航向
         """
-        dx = self.speed * math.cos(self.heading) * dt
-        dy = self.speed * math.sin(self.heading) * dt
-        return Point(self.position.x + dx, self.position.y + dy)
+        return self.position + self.speed * self.heading * dt
 
     @property
-    def components(self) -> Tuple[float, float]:
+    def components(self) -> np.ndarray:
         """
-        更新速度在 X 和 Y 方向的分量
+        获取速度在 X、Y、Z 方向的分量
         """
-        vx = self.speed * math.cos(self.heading)
-        vy = self.speed * math.sin(self.heading)
-        return vx, vy
+        return self.speed * self.heading
 
     def distance_to_target(self) -> float:
         """
         计算到目标的当前距离
         """
-        return self.position.distance(self.target)
+        return np.linalg.norm(self.position - self.target)
 
     def heading_drift(self) -> float:
         """

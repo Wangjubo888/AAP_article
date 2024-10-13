@@ -1,14 +1,9 @@
 import gym
 import numpy as np
 import random
-import math
 from typing import List, Dict
-from shapely.geometry import Point, Polygon, LineString
-from gym import spaces
 from definitions import UAV, MAX_DRONES, MIN_DISTANCE, SENSING_RANGE, MAX_EPISODE_LEN, MAX_ACCELERATION, DT, NUM_MOVE
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-import matplotlib.animation as animation
 
 
 class UrbanUAVEnv(gym.Env):
@@ -24,30 +19,24 @@ class UrbanUAVEnv(gym.Env):
 
         # 定义动作空间和观测空间
         # 动作空间：delta_speed, delta_heading, delta_altitude
-        self.action_space = spaces.Box(low=np.array([-MAX_ACCELERATION, -math.pi / 4, -5.0]),
-                                       high=np.array([MAX_ACCELERATION, math.pi / 4, 5.0]),
-                                       dtype=np.float32)
+        self.action_space = gym.spaces.Dict({
+            'delta_speed': gym.spaces.Box(-MAX_ACCELERATION, MAX_ACCELERATION, shape=(1,), dtype=np.float32),
+            'delta_heading': gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32),
+            'delta_altitude': gym.spaces.Box(-5.0, 5.0, shape=(1,), dtype=np.float32),
+        })
 
         # 观测空间：自身状态 + 邻居信息
         # 自身状态：位置（x, y, z），速度（vx, vy, vz），剩余能量
         # 邻居信息：相对位置和速度
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
+        # 观测空间
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32)
 
-        # 创建空域，多边形表示
-        self.airspace = self.create_airspace()
+        # 定义空域范围
+        self.airspace_bounds = (-200.0, -200.0, 200.0, 200.0)
 
-        # 记录完成的无人机
         self.done_drones = set()
 
-        # 初始化
         self.reset()
-
-    def create_airspace(self) -> Polygon:
-        # 定义一个简单的矩形空域，您可以根据需要进行修改
-        minx, miny = -200.0, -200.0
-        maxx, maxy = 200.0, 200.0
-        airspace_polygon = Polygon([(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)])
-        return airspace_polygon
 
     def reset(self):
         self.drones = []
@@ -55,14 +44,14 @@ class UrbanUAVEnv(gym.Env):
         for i in range(self.num_drones):
             task_type = random.choice(['takeoff', 'landing'])
             cooperative = random.choice([True, False])
-            emergency = (i == 0)  # 假设第一个无人机为紧急状态
-            drone = UAV.random_uav(self.airspace, drone_id=i, task_type=task_type,
+            emergency = (i == 0)
+            drone = UAV.random_uav(self.airspace_bounds, drone_id=i, task_type=task_type,
                                    cooperative=cooperative, emergency=emergency)
             self.drones.append(drone)
         self.time_step = 0
         return self._get_observation()
 
-    def step(self, actions: List[Dict[str, float]]):
+    def step(self, actions: List[Dict[str, np.ndarray]]):
         rewards = []
         dones = []
         infos = {}
@@ -81,10 +70,8 @@ class UrbanUAVEnv(gym.Env):
 
         # 计算奖励
         rewards = self._compute_rewards()
-
         # 获取观测
         obs = self._get_observation()
-
         # 检查是否结束
         done = self.time_step >= self.max_time_steps or len(self.done_drones) == self.num_drones
 
@@ -104,7 +91,7 @@ class UrbanUAVEnv(gym.Env):
                 if drone.r_task_completion:
                     reward += 100.0
                 # 能量消耗惩罚
-                reward -= drone.compute_energy_consumption(0, 0, 0) * 0.1
+                reward -= drone.compute_energy_consumption(0, np.array([0.0, 0.0, 0.0]), 0.0) * 0.1
                 rewards.append(reward)
         return rewards
 
@@ -114,37 +101,30 @@ class UrbanUAVEnv(gym.Env):
             if i in self.done_drones:
                 obs.append(np.zeros(self.observation_space.shape))
             else:
-                # 自身状态
-                position = np.array([drone.position.x, drone.position.y, drone.altitude])
-                velocity = np.array(drone.components + (0.0,))  # 暂时忽略垂直速度
+                position = drone.position
+                velocity = drone.components
                 energy = np.array([drone.energy])
-                # 邻居信息
                 neighbors = self._get_neighbors(drone)
                 observation = np.concatenate([position, velocity, energy, neighbors])
                 obs.append(observation)
         return obs
 
     def _get_neighbors(self, drone):
-        # 简化处理，仅考虑最近的一个邻居
         closest_distance = float('inf')
         neighbor_info = np.zeros(3)
         for other_drone in self.drones:
             if other_drone.drone_id != drone.drone_id:
-                distance = drone.position.distance(other_drone.position)
+                distance = np.linalg.norm(drone.position - other_drone.position)
                 if distance < SENSING_RANGE and distance < closest_distance:
                     closest_distance = distance
-                    relative_position = np.array([other_drone.position.x - drone.position.x,
-                                                  other_drone.position.y - drone.position.y,
-                                                  other_drone.altitude - drone.altitude])
+                    relative_position = other_drone.position - drone.position
                     neighbor_info = relative_position
         return neighbor_info
 
     def _update_collisions(self):
-        # 重置碰撞状态
         for drone in self.drones:
             drone.r_collision = 0
 
-        # 检查碰撞
         for i, drone in enumerate(self.drones):
             if i not in self.done_drones:
                 for j, other_drone in enumerate(self.drones):
@@ -152,7 +132,6 @@ class UrbanUAVEnv(gym.Env):
                         if drone.check_collision(other_drone):
                             drone.r_collision = 1
                             other_drone.r_collision = 1
-                            # 标记为完成，停止移动
                             self.done_drones.add(i)
                             self.done_drones.add(j)
 
@@ -164,26 +143,39 @@ class UrbanUAVEnv(gym.Env):
                     self.done_drones.add(i)
 
     def render(self, mode='human'):
-        # 使用 matplotlib 可视化无人机的位置
-        plt.clf()
-        plt.xlim(-250, 250)
-        plt.ylim(-250, 250)
-        plt.title('Urban UAV Environment')
-        plt.xlabel('X Position')
-        plt.ylabel('Y Position')
+        # 使用 matplotlib 的 3D 绘图功能
+        if not hasattr(self, 'fig'):
+            self.fig = plt.figure()
+            self.ax = self.fig.add_subplot(111, projection='3d')
+            plt.ion()
+        else:
+            self.ax.cla()
 
-        # 绘制无人机位置和目标
+        self.ax.set_xlim(self.airspace_bounds[0], self.airspace_bounds[2])
+        self.ax.set_ylim(self.airspace_bounds[1], self.airspace_bounds[3])
+        self.ax.set_zlim(0, 100)
+        self.ax.set_title('Urban UAV Environment')
+        self.ax.set_xlabel('X Position')
+        self.ax.set_ylabel('Y Position')
+        self.ax.set_zlabel('Altitude')
+
         for drone in self.drones:
             if drone.drone_id not in self.done_drones:
-                x, y = drone.position.x, drone.position.y
-                plt.scatter(x, y, c='blue', marker='o')
-                plt.text(x, y, f'ID:{drone.drone_id}')
+                x, y, z = drone.position
+                self.ax.scatter(x, y, z, c='blue', marker='o')
+                # 绘制无人机的轨迹
+                if not hasattr(drone, 'trajectory'):
+                    drone.trajectory = [drone.position.copy()]
+                else:
+                    drone.trajectory.append(drone.position.copy())
+                trajectory = np.array(drone.trajectory)
+                self.ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], c='blue', linewidth=0.5)
                 # 绘制目标位置
-                tx, ty = drone.target.x, drone.target.y
-                plt.scatter(tx, ty, c='red', marker='x')
+                tx, ty, tz = drone.target
+                self.ax.scatter(tx, ty, tz, c='red', marker='x')
 
                 # 绘制连线
-                plt.plot([x, tx], [y, ty], 'k--', linewidth=0.5)
+                self.ax.plot([x, tx], [y, ty], [z, tz], 'k--', linewidth=0.5)
 
         plt.pause(0.001)
 
