@@ -82,13 +82,17 @@ class UAV:
     landing_ring_altitude: float = 20.0  #
     in_approach_ring: bool = field(default=False, init=False)  # 是否进入降落排序环
     landing: bool = field(default=False, init=False)  # 是否正在降落
-    landing_pad_assigned: Optional[int] = field(default=None, init=False)  # 分配的降落场ID
+
     # 起飞相关属性
     takeoff_ring_radius: float = 50.0  # 起飞(上面）排序环的半径
     takeoff_ring_altitude: float = 50.0  # 起飞排序环的高度
     in_takeoff_ring: bool = field(default=False, init=False)  # 是否进入起飞排序环
     taking_off: bool = field(default=False, init=False)  # 是否正在起飞
     takeoff_complete: bool = field(default=False, init=False)  # 是否完成起飞
+
+    takeoff_pad_assigned: Optional[int] = field(default=None, init=False)  # 分配的起飞场ID
+    landing_pad_assigned: Optional[int] = field(default=None, init=False)  # 分配的降落场ID
+    sequence_number: Optional[int] = field(default=None, init=False)  # 降落排序序号
 
     def __post_init__(self) -> None:
         """
@@ -144,24 +148,79 @@ class UAV:
     @classmethod
     def random_uav(cls, airspace_bounds: Tuple[float, float, float, float],
                    drone_id: int, task_type: str,
-                   cooperative: bool, emergency: bool = False):
+                   cooperative: bool, environment, emergency: bool = False):
         """
-        在指定空域内创建一个随机无人机
+        根据任务类型，按照指定的逻辑生成无人机
         """
-        minx, miny, maxx, maxy = airspace_bounds
-        position = np.array([random.uniform(minx, maxx),
-                             random.uniform(miny, maxy),
-                             random.uniform(0.0, 100.0)])
-        target = np.array([random.uniform(minx, maxx),
-                           random.uniform(miny, maxy),
-                           random.uniform(0.0, 100.0)])
-        while np.linalg.norm(position - target) < 10.0:
+        uav_type = random.choice(UAV_TYPES)
+        optimal_speed = random.uniform(MIN_SPEED, MAX_SPEED)
+
+        if task_type == 'takeoff':
+            # 选择一个空闲的起飞场
+            idle_takeoff_pads = environment.get_idle_takeoff_pads()
+            if not idle_takeoff_pads:
+                raise Exception("没有可用的起飞场")
+            takeoff_pad = random.choice(idle_takeoff_pads)
+            position = environment.takeoff_pads_positions[takeoff_pad].copy()
+            position[2] = 0.0  # 高度为零
+
+            # 目标是起飞环的投影圆心位置
+            target = environment.takeoff_ring_center.copy()
+            target[2] = environment.takeoff_ring_altitude
+
+            # 创建无人机实例
+            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
+                      task_type=task_type, cooperative=cooperative, type=uav_type, emergency=emergency)
+            uav.takeoff_pad_assigned = takeoff_pad
+            uav.environment = environment
+            return uav
+
+        elif task_type == 'landing':
+            # 在空域侧面生成出生点
+            minx, miny, maxx, maxy = airspace_bounds
+            side = random.choice(['left', 'right', 'top', 'bottom'])
+            if side == 'left':
+                x = minx
+                y = random.uniform(miny, maxy)
+            elif side == 'right':
+                x = maxx
+                y = random.uniform(miny, maxy)
+            elif side == 'top':
+                x = random.uniform(minx, maxx)
+                y = maxy
+            else:  # 'bottom'
+                x = random.uniform(minx, maxx)
+                y = miny
+            position = np.array([x, y, random.uniform(environment.min_altitude, environment.max_altitude)])
+
+            # 目标是降落环外部的进近空域
+            target = environment.landing_approach_point.copy()
+
+            # 创建无人机实例
+            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
+                      task_type=task_type, cooperative=cooperative, type=uav_type, emergency=emergency)
+            # 分配降落排序序号
+            uav.sequence_number = environment.get_next_landing_sequence()
+            uav.environment = environment
+            return uav
+
+        else:
+            # 巡航任务，按照之前的逻辑
+            minx, miny, maxx, maxy = airspace_bounds
+            position = np.array([random.uniform(minx, maxx),
+                                 random.uniform(miny, maxy),
+                                 random.uniform(environment.min_altitude, environment.max_altitude)])
             target = np.array([random.uniform(minx, maxx),
                                random.uniform(miny, maxy),
-                               random.uniform(0.0, 100.0)])
-        optimal_speed = random.uniform(MIN_SPEED, MAX_SPEED)
-        return cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
-                   task_type=task_type, cooperative=cooperative, emergency=emergency)
+                               random.uniform(environment.min_altitude, environment.max_altitude)])
+            while np.linalg.norm(position - target) < 10.0:
+                target = np.array([random.uniform(minx, maxx),
+                                   random.uniform(miny, maxy),
+                                   random.uniform(environment.min_altitude, environment.max_altitude)])
+            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
+                      task_type=task_type, cooperative=cooperative, type=uav_type, emergency=emergency)
+            uav.environment = environment
+            return uav
 
     def _generate_destination(self, uav_id):
         # 生成目的地，根据任务类型
@@ -208,56 +267,37 @@ class UAV:
         self.energy -= self.compute_energy_consumption(delta_speed, delta_heading, delta_altitude)
         self.path_length += self.speed * dt
 
-        # 着陆逻辑
-        if self.task_type == 'landing':
-            distance_to_ring_center = np.linalg.norm(self.position[:2] - self.approach_ring_center[:2])
-
-            if not self.in_approach_ring and distance_to_ring_center <= self.approach_ring_radius:
-                self.in_approach_ring = True
-                self.target = self.landing_point
-                self.heading = self.calculate_direction()
-
-            if self.in_approach_ring and not self.landing:
-                self.heading[2] = 0.0  # 保持水平飞行
-                distance_to_landing_point = np.linalg.norm(self.position[:2] - self.landing_point[:2])
-
-                if distance_to_landing_point <= 5.0:
-                    self.landing = True
-
-            if self.landing:
-                if self.environment.landing_pad_status == 'available':
-                    self.vertical_landing()
-                else:
-                    self.speed = 0.0  # 悬停
-        elif self.task_type == 'takeoff':
+        if self.task_type == 'takeoff':
             self.takeoff_logic()
+        elif self.task_type == 'landing':
+            self.landing_logic()
 
     def takeoff_logic(self):
         """
-        执行起飞任务的无人机的起飞逻辑
+        起飞任务的无人机逻辑
         """
         if not self.taking_off:
             # 检查起飞场是否可用
-            if self.environment.takeoff_pad_status == 'available':
+            if self.environment.takeoff_pads_status[self.takeoff_pad_assigned] == 'available':
                 # 起飞场可用，开始起飞
                 self.taking_off = True
-                self.environment.takeoff_pad_status = 'occupied'
-                self.environment.takeoff_pad_cooldown_timer = 0
+                self.environment.takeoff_pads_status[self.takeoff_pad_assigned] = 'occupied'
+                self.environment.takeoff_pad_cooldown_timers[self.takeoff_pad_assigned] = 0
             else:
                 # 起飞场不可用，等待
                 pass
         elif self.taking_off and not self.in_takeoff_ring:
-            # 垂直上升至起飞排序环高度
+            # 垂直上升至起飞环高度
             ascent_speed = np.clip(self.speed, MIN_SPEED, MAX_SPEED)
             self.altitude += ascent_speed * DT
             self.position[2] = self.altitude
-            if self.altitude >= self.takeoff_ring_altitude:
+            if self.altitude >= self.environment.takeoff_ring_altitude:
                 self.in_takeoff_ring = True
                 # 设置航向为沿起飞排序环飞行
                 self.heading = self.calculate_takeoff_ring_heading()
         elif self.in_takeoff_ring and not self.takeoff_complete:
-            # 沿着起飞排序环维持高度飞行
-            self.altitude = self.takeoff_ring_altitude
+            # 沿着起飞排序环飞行
+            self.altitude = self.environment.takeoff_ring_altitude
             self.position[2] = self.altitude
             # 检查是否可以驶出起飞排序环
             if self.can_depart_takeoff_ring():
@@ -269,8 +309,65 @@ class UAV:
                 self.move_along_takeoff_ring()
         elif self.takeoff_complete:
             # 起飞完成，按照正常逻辑飞行
-            # ...（可以调用原有的移动逻辑或进行调整）
-            self.move_towards_target()
+            # 更新位置
+            dt = DT
+            self.position += self.speed * self.heading * dt
+            self.position[2] = self.altitude
+        else:
+            pass  # 其他情况
+
+    def landing_logic(self):
+        """
+        降落任务的无人机逻辑
+        """
+        if not self.in_approach_ring:
+            # 前往降落进近点
+            self.heading = self.calculate_direction()
+            dt = DT
+            self.position += self.speed * self.heading * dt
+            self.position[2] = self.altitude
+            if np.linalg.norm(self.position - self.target) < 5.0:
+                self.in_approach_ring = True
+                # 更新目标为降落环
+                self.target = self.environment.landing_ring_center.copy()
+        elif self.in_approach_ring and not self.landing:
+            # 按序号进入降落环
+            # 简化逻辑，直接进入降落环
+            self.altitude = self.environment.landing_ring_altitude
+            self.position[2] = self.altitude
+            # 绕降落环飞行
+            self.heading = self.calculate_landing_ring_heading()
+            dt = DT
+            self.position += self.speed * self.heading * dt
+            self.position[2] = self.altitude
+            # 检查是否有空闲的降落场
+            idle_landing_pads = self.environment.get_idle_landing_pads()
+            if idle_landing_pads:
+                self.landing_pad_assigned = idle_landing_pads[0]  # 按序号分配
+                self.environment.landing_pads_status[self.landing_pad_assigned] = 'occupied'
+                self.environment.landing_pad_cooldown_timers[self.landing_pad_assigned] = 0
+                self.landing = True
+                # 更新目标为降落场的投影圆心位置
+                self.target = self.environment.landing_pads_positions[self.landing_pad_assigned].copy()
+                self.target[2] = self.altitude
+        elif self.landing:
+            # 从降落环驶向降落场的投影圆心位置
+            self.heading = self.calculate_direction()
+            dt = DT
+            self.position += self.speed * self.heading * dt
+            self.position[2] = self.altitude
+            if np.linalg.norm(self.position - self.target) < 5.0:
+                # 垂直下降
+                descent_speed = np.clip(self.speed, MIN_SPEED, MAX_SPEED)
+                self.altitude -= descent_speed * DT
+                self.position[2] = self.altitude
+                if self.altitude <= self.min_altitude:
+                    self.altitude = self.min_altitude
+                    self.position[2] = self.altitude
+                    self.r_task_completion = 1
+                    # 标记降落场为占用状态，重置冷却计时器
+                    self.environment.landing_pads_status[self.landing_pad_assigned] = 'occupied'
+                    self.environment.landing_pad_cooldown_timers[self.landing_pad_assigned] = 0
         else:
             pass  # 其他情况
 
@@ -279,9 +376,20 @@ class UAV:
         计算沿着起飞排序环飞行的航向
         """
         # 计算当前位置在起飞排序环上的切线方向
-        # 起飞排序环中心
-        center = self.environment.takeoff_pad_position.copy()
-        center[2] = self.takeoff_ring_altitude
+        center = self.environment.takeoff_ring_center.copy()
+        direction = np.cross(np.array([0, 0, 1]), self.position - center)
+        norm = np.linalg.norm(direction)
+        if norm != 0:
+            return direction / norm
+        else:
+            return np.array([0.0, 0.0, 0.0])
+
+    def calculate_landing_ring_heading(self):
+        """
+        计算沿着降落排序环飞行的航向
+        """
+        # 计算当前位置在降落排序环上的切线方向
+        center = self.environment.landing_ring_center.copy()
         direction = np.cross(np.array([0, 0, 1]), self.position - center)
         norm = np.linalg.norm(direction)
         if norm != 0:

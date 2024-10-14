@@ -17,6 +17,37 @@ class UrbanUAVEnv(gym.Env):
         self.max_time_steps = MAX_EPISODE_LEN
         self.num_move = NUM_MOVE
 
+        # 起飞场和降落场的配置
+        self.takeoff_pads_positions = {
+            0: np.array([-150.0, -150.0, 0.0]),
+            1: np.array([150.0, -150.0, 0.0]),
+        }
+        self.landing_pads_positions = {
+            0: np.array([-150.0, 150.0, 0.0]),
+            1: np.array([150.0, 150.0, 0.0]),
+        }
+        self.takeoff_pads_status = {0: 'available', 1: 'available'}
+        self.landing_pads_status = {0: 'available', 1: 'available'}
+        self.takeoff_pad_cooldown = 10
+        self.landing_pad_cooldown = 10
+        self.takeoff_pad_cooldown_timers = {0: 0, 1: 0}
+        self.landing_pad_cooldown_timers = {0: 0, 1: 0}
+
+        # 起飞环参数
+        self.takeoff_ring_center = np.array([0.0, -150.0, 20.0])
+        self.takeoff_ring_altitude = 20.0
+
+        # 降落环参数
+        self.landing_ring_center = np.array([0.0, 150.0, 20.0])
+        self.landing_ring_altitude = 20.0
+        self.landing_ring_radius = 50.0
+
+        # 降落进近点（降落环外部）
+        self.landing_approach_point = np.array([0.0, 200.0, 20.0])
+
+        # 降落排序序号计数器
+        self.landing_sequence_counter = 0
+
         # 定义动作空间和观测空间
         # 动作空间：delta_speed, delta_heading, delta_altitude
         self.action_space = gym.spaces.Dict({
@@ -30,26 +61,43 @@ class UrbanUAVEnv(gym.Env):
         # 邻居信息：相对位置和速度
         # 观测空间
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32)
-
         # 定义空域范围
         self.airspace_bounds = (-200.0, -200.0, 200.0, 200.0)
-
         self.done_drones = set()
-
         self.reset()
+
+    def get_idle_landing_pads(self):
+        """获取空闲的降落场列表"""
+        return [pad_id for pad_id, status in self.landing_pads_status.items() if status == 'available']
 
     def reset(self):
         self.drones = []
         self.done_drones = set()
+        # 重置起飞场和降落场状态
+        self.takeoff_pads_status = {0: 'available', 1: 'available'}
+        self.landing_pads_status = {0: 'available', 1: 'available'}
+        self.takeoff_pad_cooldown_timers = {0: 0, 1: 0}
+        self.landing_pad_cooldown_timers = {0: 0, 1: 0}
+        self.landing_sequence_counter = 0
+
         for i in range(self.num_drones):
             task_type = random.choice(['takeoff', 'landing'])
             cooperative = random.choice([True, False])
             emergency = (i == 0)
             drone = UAV.random_uav(self.airspace_bounds, drone_id=i, task_type=task_type,
-                                   cooperative=cooperative, emergency=emergency)
+                                   cooperative=cooperative, environment=self, emergency=emergency)
             self.drones.append(drone)
         self.time_step = 0
         return self._get_observation()
+
+    def get_idle_takeoff_pads(self):
+        """获取空闲的起飞场列表"""
+        return [pad_id for pad_id, status in self.takeoff_pads_status.items() if status == 'available']
+
+    def get_next_landing_sequence(self):
+        """获取下一个降落排序序号"""
+        self.landing_sequence_counter += 1
+        return self.landing_sequence_counter
 
     def step(self, actions: List[Dict[str, np.ndarray]]):
         rewards = []
@@ -74,8 +122,26 @@ class UrbanUAVEnv(gym.Env):
         obs = self._get_observation()
         # 检查是否结束
         done = self.time_step >= self.max_time_steps or len(self.done_drones) == self.num_drones
-
+        self._update_pads_status()
         return obs, rewards, done, infos
+
+    def _update_pads_status(self):
+        """更新起飞场和降落场的状态和冷却计时器"""
+        # 更新起飞场
+        for pad_id, status in self.takeoff_pads_status.items():
+            if status == 'occupied':
+                self.takeoff_pad_cooldown_timers[pad_id] += 1
+                if self.takeoff_pad_cooldown_timers[pad_id] >= self.takeoff_pad_cooldown:
+                    self.takeoff_pads_status[pad_id] = 'available'
+                    self.takeoff_pad_cooldown_timers[pad_id] = 0
+
+        # 更新降落场
+        for pad_id, status in self.landing_pads_status.items():
+            if status == 'occupied':
+                self.landing_pad_cooldown_timers[pad_id] += 1
+                if self.landing_pad_cooldown_timers[pad_id] >= self.landing_pad_cooldown:
+                    self.landing_pads_status[pad_id] = 'available'
+                    self.landing_pad_cooldown_timers[pad_id] = 0
 
     def _compute_rewards(self):
         rewards = []
