@@ -18,6 +18,28 @@ NUM_DETECTION_SECTORS = 12  # 检测区域划分的扇区数
 RANGE_DETECTION = 100.0  # 检测区域半径，单位：m
 MIN_DISTANCE = 5.0  # 无人机之间的最小安全距离，单位：m
 
+# 定义无人机类型
+UAV_TYPES = ['multirotor', 'light_hybrid_wing', 'medium_hybrid_wing', 'heavy_hybrid_wing']
+UAV_TYPE_MAPPING = {
+    'multirotor': 0,
+    'light_hybrid_wing': 1,
+    'medium_hybrid_wing': 2,
+    'heavy_hybrid_wing': 3
+}
+safety_intervals = {
+        'multirotor': {'multirotor': 82, 'light_hybrid_wing': 84, 'medium_hybrid_wing': 90, 'heavy_hybrid_wing': 96},
+        'light_hybrid_wing': {'multirotor': 84, 'light_hybrid_wing': 83, 'medium_hybrid_wing': 91, 'heavy_hybrid_wing': 97},
+        'medium_hybrid_wing': {'multirotor': 90, 'light_hybrid_wing': 91, 'medium_hybrid_wing': 93, 'heavy_hybrid_wing': 100},
+        'heavy_hybrid_wing': {'multirotor': 96, 'light_hybrid_wing': 97, 'medium_hybrid_wing': 100, 'heavy_hybrid_wing': 102}
+    }
+# 定义不同类型组合之间的最小安全距离矩阵（单位：米）
+MIN_SAFE_DISTANCE_MATRIX = {
+    'multirotor': {'multirotor': 82, 'light_hybrid_wing': 84, 'medium_hybrid_wing': 90, 'heavy_hybrid_wing': 96},
+    'light_hybrid_wing': {'light_hybrid_wing': 83, 'medium_hybrid_wing': 91, 'heavy_hybrid_wing': 97},
+    'medium_hybrid_wing': {'medium_hybrid_wing': 93, 'heavy_hybrid_wing': 100},
+    'heavy_hybrid_wing': {'heavy_hybrid_wing': 102}
+}
+
 
 # 定义无人机类
 @dataclass
