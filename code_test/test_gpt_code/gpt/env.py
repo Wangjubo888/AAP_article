@@ -16,7 +16,8 @@ class UrbanUAVEnv(gym.Env):
         self.time_step = 0
         self.max_time_steps = MAX_EPISODE_LEN
         self.num_move = NUM_MOVE
-
+        self.cylinder_radius = 5000
+        self.cylinder_height = 1500
         # 起飞场和降落场的配置
         self.takeoff_pads_positions = {
             0: np.array([-150.0, -150.0, 0.0]),
@@ -70,6 +71,18 @@ class UrbanUAVEnv(gym.Env):
         """获取空闲的降落场列表"""
         return [pad_id for pad_id, status in self.landing_pads_status.items() if status == 'available']
 
+    def _spawn_on_surface(self):
+        """
+        在圆柱体侧表面生成一点
+        :return:侧表面np.array([x,y,z]) \
+        [ 983.23415065 -182.34748423  132.68898602]
+        """
+        theta = random.uniform(0, 2 * np.pi)
+        x = self.cylinder_radius * np.cos(theta)
+        y = self.cylinder_radius * np.sin(theta)
+        z = np.random.uniform(0, self.cylinder_height)
+        return np.array([x, y, z])
+
     def reset(self):
         self.drones = []
         self.done_drones = set()
@@ -87,6 +100,7 @@ class UrbanUAVEnv(gym.Env):
             drone = UAV.random_uav(self.airspace_bounds, drone_id=i, task_type=task_type,
                                    cooperative=cooperative, environment=self, emergency=emergency)
             self.drones.append(drone)
+        print(self.drones)
         self.time_step = 0
         return self._get_observation()
 

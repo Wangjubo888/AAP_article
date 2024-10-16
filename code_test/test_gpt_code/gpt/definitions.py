@@ -1,22 +1,28 @@
-import math
-import random
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Tuple, Optional
-from shapely.geometry import Point, Polygon
-import numpy as np
+import random
 
 # 常量定义
 MAX_DRONES = 20  # 最大无人机数量
-MAX_SPEED = 15.0  # 最大速度，单位：m/s
+MAX_SPEED = 20.0  # 最大速度，单位：m/s
 MIN_SPEED = 5.0   # 最小速度，单位：m/s
 MAX_ACCELERATION = 5.0  # 最大加速度，单位：m/s²
 SENSING_RANGE = 100.0  # 感知范围，单位：m
+RANGE_DETECTION = 100.0  # 检测区域半径，单位：m
 DT = 0.1  # 时间步长，单位：s
 NUM_MOVE = 5  # 每个动作的移动步数
 MAX_EPISODE_LEN = 500  # 最大回合长度
 NUM_DETECTION_SECTORS = 12  # 检测区域划分的扇区数
-RANGE_DETECTION = 100.0  # 检测区域半径，单位：m
 MIN_DISTANCE = 5.0  # 无人机之间的最小安全距离，单位：m
+
+# 空域参数
+R1 = 100.0   # 起飞/降落场和环的半径
+R2 = 150.0   # 进近区域的半径（R2 > R1）
+R3 = 300.0   # 外部空域的半径
+H1 = 120.0   # 起飞环的高度
+H2 = 80.0    # 降落环的高度
+MAX_ALTITUDE = 1500.0  # 空域的最大高度
 
 # 定义无人机类型
 UAV_TYPES = ['multirotor', 'light_hybrid_wing', 'medium_hybrid_wing', 'heavy_hybrid_wing']
@@ -26,18 +32,25 @@ UAV_TYPE_MAPPING = {
     'medium_hybrid_wing': 2,
     'heavy_hybrid_wing': 3
 }
-safety_intervals = {
-        'multirotor': {'multirotor': 82, 'light_hybrid_wing': 84, 'medium_hybrid_wing': 90, 'heavy_hybrid_wing': 96},
-        'light_hybrid_wing': {'multirotor': 84, 'light_hybrid_wing': 83, 'medium_hybrid_wing': 91, 'heavy_hybrid_wing': 97},
-        'medium_hybrid_wing': {'multirotor': 90, 'light_hybrid_wing': 91, 'medium_hybrid_wing': 93, 'heavy_hybrid_wing': 100},
-        'heavy_hybrid_wing': {'multirotor': 96, 'light_hybrid_wing': 97, 'medium_hybrid_wing': 100, 'heavy_hybrid_wing': 102}
-    }
 # 定义不同类型组合之间的最小安全距离矩阵（单位：米）
 MIN_SAFE_DISTANCE_MATRIX = {
-    'multirotor': {'multirotor': 82, 'light_hybrid_wing': 84, 'medium_hybrid_wing': 90, 'heavy_hybrid_wing': 96},
-    'light_hybrid_wing': {'light_hybrid_wing': 83, 'medium_hybrid_wing': 91, 'heavy_hybrid_wing': 97},
-    'medium_hybrid_wing': {'medium_hybrid_wing': 93, 'heavy_hybrid_wing': 100},
-    'heavy_hybrid_wing': {'heavy_hybrid_wing': 102}
+    ('multirotor', 'multirotor'): 10.0,
+    ('multirotor', 'light_hybrid_wing'): 15.0,
+    ('multirotor', 'medium_hybrid_wing'): 20.0,
+    ('multirotor', 'heavy_hybrid_wing'): 25.0,
+    ('light_hybrid_wing', 'light_hybrid_wing'): 15.0,
+    ('light_hybrid_wing', 'medium_hybrid_wing'): 20.0,
+    ('light_hybrid_wing', 'heavy_hybrid_wing'): 25.0,
+    ('medium_hybrid_wing', 'medium_hybrid_wing'): 25.0,
+    ('medium_hybrid_wing', 'heavy_hybrid_wing'): 30.0,
+    ('heavy_hybrid_wing', 'heavy_hybrid_wing'): 35.0,
+    # 对称性
+    ('light_hybrid_wing', 'multirotor'): 15.0,
+    ('medium_hybrid_wing', 'multirotor'): 20.0,
+    ('heavy_hybrid_wing', 'multirotor'): 25.0,
+    ('medium_hybrid_wing', 'light_hybrid_wing'): 20.0,
+    ('heavy_hybrid_wing', 'light_hybrid_wing'): 25.0,
+    ('heavy_hybrid_wing', 'medium_hybrid_wing'): 30.0,
 }
 
 
@@ -45,14 +58,15 @@ MIN_SAFE_DISTANCE_MATRIX = {
 @dataclass
 class UAV:
     drone_id: int
+    uav_type: str
     position: np.ndarray  # 三维坐标，形状为 (3,)
     target: np.ndarray  # 三维坐标，形状为 (3,)
     task_type: str  # 'takeoff' 或 'landing'
     cooperative: bool  # 是否为合作无人机
+    optimal_speed: float  # 最优速度，单位：m/s
     emergency: bool = False  # 是否为紧急状态
     max_altitude: float = 1500.0  # 最大高度，单位：m，同样也是研究空域最大高度
     min_altitude: float = 0.0    # 最小高度，单位：m
-    optimal_speed: float = 10.0  # 最优速度，单位：m/s
 
     speed: float = field(init=False)
     heading: np.ndarray = field(init=False)  # 三维方向向量
@@ -76,16 +90,18 @@ class UAV:
     r_task_completion: int = 0
     r_energy_efficiency: int = 0
     r_safety: int = 0
+    environment: Optional[object] = field(default=None, init=False)  # 环境引用
 
     # 起飞降落环属性、起降场冷却
     landing_ring_radius: float = 30.0  # 降落（在下面）排序环的半径
-    landing_ring_altitude: float = 20.0  #
+    landing_ring_altitude: float = 20.0  # 降落排序环的高度
     in_approach_ring: bool = field(default=False, init=False)  # 是否进入降落排序环
     landing: bool = field(default=False, init=False)  # 是否正在降落
+    landing_complete: bool = field(default=False, init=False)  # 是否完成起飞
 
     # 起飞相关属性
     takeoff_ring_radius: float = 50.0  # 起飞(上面）排序环的半径
-    takeoff_ring_altitude: float = 50.0  # 起飞排序环的高度
+    takeoff_takeoff_complete: bool = field(default=False, init=False)  # 是否完成起飞ring_altitude: float = 50.0  # 起飞排序环的高度
     in_takeoff_ring: bool = field(default=False, init=False)  # 是否进入起飞排序环
     taking_off: bool = field(default=False, init=False)  # 是否正在起飞
     takeoff_complete: bool = field(default=False, init=False)  # 是否完成起飞
@@ -93,6 +109,7 @@ class UAV:
     takeoff_pad_assigned: Optional[int] = field(default=None, init=False)  # 分配的起飞场ID
     landing_pad_assigned: Optional[int] = field(default=None, init=False)  # 分配的降落场ID
     sequence_number: Optional[int] = field(default=None, init=False)  # 降落排序序号
+
 
     def __post_init__(self) -> None:
         """
@@ -108,6 +125,12 @@ class UAV:
         #     self.altitude = random.uniform(self.min_altitude, self.max_altitude)
         self.last_altitude = self.altitude
         self.optimal_path_length = np.linalg.norm(self.position - self.target)
+        self.energy = 100.0  # 初始能量
+        self.path_length = 0.0
+        self.r_collision = 0
+        self.r_task_completion = 0
+        self.environment = None  # 将在环境中设置
+        self.distance_to_target()
 
     def calculate_direction(self) -> np.ndarray:
         """
@@ -146,13 +169,16 @@ class UAV:
         return desired_direction - self.heading
 
     @classmethod
-    def random_uav(cls, airspace_bounds: Tuple[float, float, float, float],
+    def random_uav(cls, airspace_bounds: Tuple[float, float],
                    drone_id: int, task_type: str,
-                   cooperative: bool, environment, emergency: bool = False):
+                   cooperative: bool, environment, uav_type: str, emergency: bool = False):
         """
         根据任务类型，按照指定的逻辑生成无人机
         """
-        uav_type = random.choice(UAV_TYPES)
+        # 如果没有传入 uav_type，则随机选择
+        if uav_type is None:
+            uav_type = random.choice(UAV_TYPES)
+
         optimal_speed = random.uniform(MIN_SPEED, MAX_SPEED)
 
         if task_type == 'takeoff':
@@ -168,37 +194,29 @@ class UAV:
             target = environment.takeoff_ring_center.copy()
             target[2] = environment.takeoff_ring_altitude
 
-            # 创建无人机实例
+            # 创建无人机实例，将 uav_type 传递给实例
             uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
-                      task_type=task_type, cooperative=cooperative, type=uav_type, emergency=emergency)
+                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
+
             uav.takeoff_pad_assigned = takeoff_pad
             uav.environment = environment
             return uav
 
         elif task_type == 'landing':
             # 在空域侧面生成出生点
-            minx, miny, maxx, maxy = airspace_bounds
-            side = random.choice(['left', 'right', 'top', 'bottom'])
-            if side == 'left':
-                x = minx
-                y = random.uniform(miny, maxy)
-            elif side == 'right':
-                x = maxx
-                y = random.uniform(miny, maxy)
-            elif side == 'top':
-                x = random.uniform(minx, maxx)
-                y = maxy
-            else:  # 'bottom'
-                x = random.uniform(minx, maxx)
-                y = miny
-            position = np.array([x, y, random.uniform(environment.min_altitude, environment.max_altitude)])
+            maxr, cylinder_height = airspace_bounds
+            theta = random.uniform(0, 2 * np.pi)
+            x = maxr * np.cos(theta)
+            y = maxr * np.sin(theta)
+            z = np.random.uniform(0, cylinder_height)
+            position = np.array([x, y, z])
 
             # 目标是降落环外部的进近空域
             target = environment.landing_approach_point.copy()
 
             # 创建无人机实例
             uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
-                      task_type=task_type, cooperative=cooperative, type=uav_type, emergency=emergency)
+                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
             # 分配降落排序序号
             uav.sequence_number = environment.get_next_landing_sequence()
             uav.environment = environment
@@ -206,40 +224,24 @@ class UAV:
 
         else:
             # 巡航任务，按照之前的逻辑
-            minx, miny, maxx, maxy = airspace_bounds
-            position = np.array([random.uniform(minx, maxx),
-                                 random.uniform(miny, maxy),
-                                 random.uniform(environment.min_altitude, environment.max_altitude)])
-            target = np.array([random.uniform(minx, maxx),
-                               random.uniform(miny, maxy),
-                               random.uniform(environment.min_altitude, environment.max_altitude)])
+            maxx, cylinder_height = airspace_bounds
+            maxy = maxx
+            minx = -maxx
+            miny = -maxy
+            position = environment._spawn_on_surface()
+            target = environment._spawn_on_surface()
             while np.linalg.norm(position - target) < 10.0:
                 target = np.array([random.uniform(minx, maxx),
                                    random.uniform(miny, maxy),
                                    random.uniform(environment.min_altitude, environment.max_altitude)])
             uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
-                      task_type=task_type, cooperative=cooperative, type=uav_type, emergency=emergency)
+                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
             uav.environment = environment
             return uav
 
     def _generate_destination(self, uav_id):
         # 生成目的地，根据任务类型
-        if self.task_type == 'takeoff':
-            return self._spawn_on_surface()
-        elif self.task_type == 'landing':
-            return self.assign_landing_target(uav_id)
-
-    def _spawn_on_surface(self):
-        """
-        在圆柱体侧表面生成一点
-        :return:侧表面np.array([x,y,z]) \
-        [ 983.23415065 -182.34748423  132.68898602]
-        """
-        theta = random.uniform(0, 2 * np.pi)
-        x = self.cylinder_radius * np.cos(theta)
-        y = self.cylinder_radius * np.sin(theta)
-        z = np.random.uniform(0, self.cylinder_height)
-        return np.array([x, y, z])
+        pass
 
     def step(self, action: dict):
         """
