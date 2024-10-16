@@ -110,19 +110,19 @@ class UAV:
     landing_pad_assigned: Optional[int] = field(default=None, init=False)  # 分配的降落场ID
     sequence_number: Optional[int] = field(default=None, init=False)  # 降落排序序号
 
-
     def __post_init__(self) -> None:
         """
         初始化无人机的航向、速度和高度
         """
         self.heading = self.calculate_direction()
-        self.speed = self.optimal_speed
-        if self.task_type == 'takeoff':
-            self.altitude = self.min_altitude  # 起飞任务从最低高度开始
-        elif self.task_type == 'landing':
-            self.altitude = random.uniform(self.min_altitude, self.max_altitude)
+        self.speed = random.uniform(MIN_SPEED, MAX_SPEED)
+        # if self.task_type == 'takeoff':
+        #     self.altitude = self.min_altitude  # 起飞任务从最低高度开始
+        # elif self.task_type == 'landing':
+        #     self.altitude = random.uniform(self.min_altitude, self.max_altitude)
         # else:
         #     self.altitude = random.uniform(self.min_altitude, self.max_altitude)
+        self.altitude = self.position[2].item()
         self.last_altitude = self.altitude
         self.optimal_path_length = np.linalg.norm(self.position - self.target)
         self.energy = 100.0  # 初始能量
@@ -137,142 +137,28 @@ class UAV:
         计算当前位姿到目标的方向向量（单位向量）
         """
         direction = self.target - self.position
+        direction[2] = 0.0  # 投影到水平面
         norm = np.linalg.norm(direction)
-        if norm == 0:
-            return np.array([0.0, 0.0, 0.0])
-        return direction / norm
-
-    def predict_position(self, dt: float = DT) -> np.ndarray:
-        """
-        预测在 dt 秒后的未来位置，保持当前速度和航向
-        """
-        return self.position + self.speed * self.heading * dt
-
-    @property
-    def components(self) -> np.ndarray:
-        """
-        获取速度在 X、Y、Z 方向的分量
-        """
-        return self.speed * self.heading
-
-    def distance_to_target(self) -> float:
-        """
-        计算到目标的当前距离
-        """
-        return np.linalg.norm(self.position - self.target)
-
-    def heading_drift(self) -> np.ndarray:
-        """
-        计算当前航向与目标航向之间的偏差向量
-        """
-        desired_direction = self.calculate_direction()
-        return desired_direction - self.heading
-
-    @classmethod
-    def random_uav(cls, airspace_bounds: Tuple[float, float],
-                   drone_id: int, task_type: str,
-                   cooperative: bool, environment, uav_type: str, emergency: bool = False):
-        """
-        根据任务类型，按照指定的逻辑生成无人机
-        """
-        # 如果没有传入 uav_type，则随机选择
-        if uav_type is None:
-            uav_type = random.choice(UAV_TYPES)
-
-        optimal_speed = random.uniform(MIN_SPEED, MAX_SPEED)
-
-        if task_type == 'takeoff':
-            # 选择一个空闲的起飞场
-            idle_takeoff_pads = environment.get_idle_takeoff_pads()
-            if not idle_takeoff_pads:
-                raise Exception("没有可用的起飞场")
-            takeoff_pad = random.choice(idle_takeoff_pads)
-            position = environment.takeoff_pads_positions[takeoff_pad].copy()
-            position[2] = 0.0  # 高度为零
-
-            # 目标是起飞环的投影圆心位置
-            target = environment.takeoff_ring_center.copy()
-            target[2] = environment.takeoff_ring_altitude
-
-            # 创建无人机实例，将 uav_type 传递给实例
-            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
-                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
-
-            uav.takeoff_pad_assigned = takeoff_pad
-            uav.environment = environment
-            return uav
-
-        elif task_type == 'landing':
-            # 在空域侧面生成出生点
-            maxr, cylinder_height = airspace_bounds
-            theta = random.uniform(0, 2 * np.pi)
-            x = maxr * np.cos(theta)
-            y = maxr * np.sin(theta)
-            z = np.random.uniform(0, cylinder_height)
-            position = np.array([x, y, z])
-
-            # 目标是降落环外部的进近空域
-            target = environment.landing_approach_point.copy()
-
-            # 创建无人机实例
-            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
-                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
-            # 分配降落排序序号
-            uav.sequence_number = environment.get_next_landing_sequence()
-            uav.environment = environment
-            return uav
-
-        else:
-            # 巡航任务，按照之前的逻辑
-            maxx, cylinder_height = airspace_bounds
-            maxy = maxx
-            minx = -maxx
-            miny = -maxy
-            position = environment._spawn_on_surface()
-            target = environment._spawn_on_surface()
-            while np.linalg.norm(position - target) < 10.0:
-                target = np.array([random.uniform(minx, maxx),
-                                   random.uniform(miny, maxy),
-                                   random.uniform(environment.min_altitude, environment.max_altitude)])
-            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
-                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
-            uav.environment = environment
-            return uav
-
-    def _generate_destination(self, uav_id):
-        # 生成目的地，根据任务类型
-        pass
+        return direction / norm if norm != 0 else np.array([0.0, 0.0, 0.0])
 
     def step(self, action: dict):
         """
-        根据给定的动作更新无人机的状态
-        """
+                根据给定的动作更新无人机的状态
+                """
         # 获取动作指令中的速度、航向及高度变化量
         delta_speed = action.get('delta_speed', 0.0)
         delta_heading = action.get('delta_heading', np.array([0.0, 0.0, 0.0]))
         delta_altitude = action.get('delta_altitude', 0.0)
-
-        # 更新当前对象的速度、航向及高度，并限制在合理范围内
-        self.speed = np.clip(self.speed + delta_speed, MIN_SPEED, MAX_SPEED)
-        new_heading = self.heading + delta_heading
-        norm = np.linalg.norm(new_heading)
-        if norm != 0:
-            self.heading = new_heading / norm
-        self.altitude = np.clip(self.altitude + delta_altitude, self.min_altitude, self.max_altitude)
-
-        # 根据时间步长DT更新位置
         dt = DT
-        self.position += self.speed * self.heading * dt
-        self.position[2] = self.altitude
-
-        # 减少能量并累加路径长度
         self.energy -= self.compute_energy_consumption(delta_speed, delta_heading, delta_altitude)
         self.path_length += self.speed * dt
-
         if self.task_type == 'takeoff':
             self.takeoff_logic()
         elif self.task_type == 'landing':
             self.landing_logic()
+        else:
+            self.cruise_logic(action)
+            # 减少能量并累加路径长度
 
     def takeoff_logic(self):
         """
@@ -372,6 +258,104 @@ class UAV:
                     self.environment.landing_pad_cooldown_timers[self.landing_pad_assigned] = 0
         else:
             pass  # 其他情况
+    def predict_position(self, dt: float = DT) -> np.ndarray:
+        """
+        预测在 dt 秒后的未来位置，保持当前速度和航向
+        """
+        return self.position + self.speed * self.heading * dt
+
+    @property
+    def components(self) -> np.ndarray:
+        """
+        获取速度在 X、Y、Z 方向的分量
+        """
+        return self.speed * self.heading
+
+    def distance_to_target(self) -> float:
+        """
+        计算到目标的当前距离
+        """
+        return np.linalg.norm(self.position - self.target)
+
+    def heading_drift(self) -> np.ndarray:
+        """
+        计算当前航向与目标航向之间的偏差向量
+        """
+        desired_direction = self.calculate_direction()
+        return desired_direction - self.heading
+
+    @classmethod
+    def random_uav(cls, drone_id: int, task_type: str, environment):
+        """
+        根据任务类型，按照指定的逻辑生成无人机
+        """
+        # 如果没有传入 uav_type，则随机选择
+        if uav_type is None:
+            uav_type = random.choice(UAV_TYPES)
+        cooperative = random.choice([True, False])
+        optimal_speed = random.uniform(MIN_SPEED, MAX_SPEED)
+
+        if task_type == 'takeoff':
+            # 选择一个空闲的起飞场
+            idle_takeoff_pads = environment.get_idle_takeoff_pads()
+            if not idle_takeoff_pads:
+                raise Exception("没有可用的起飞场")
+            takeoff_pad = random.choice(idle_takeoff_pads)
+            position = environment.takeoff_pads_positions[takeoff_pad].copy()
+            position[2] = 0.0  # 高度为零
+
+            # 目标是起飞环的投影圆心位置
+            target = environment.takeoff_ring_center.copy()
+            target[2] = environment.takeoff_ring_altitude
+
+            # 创建无人机实例，将 uav_type 传递给实例
+            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
+                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
+
+            uav.takeoff_pad_assigned = takeoff_pad
+            uav.environment = environment
+            return uav
+
+        elif task_type == 'landing':
+            # 在空域侧面生成出生点
+            maxr, cylinder_height = airspace_bounds
+            theta = random.uniform(0, 2 * np.pi)
+            x = maxr * np.cos(theta)
+            y = maxr * np.sin(theta)
+            z = np.random.uniform(0, cylinder_height)
+            position = np.array([x, y, z])
+
+            # 目标是降落环外部的进近空域
+            target = environment.landing_approach_point.copy()
+
+            # 创建无人机实例
+            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
+                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
+            # 分配降落排序序号
+            uav.sequence_number = environment.get_next_landing_sequence()
+            uav.environment = environment
+            return uav
+
+        else:
+            # 巡航任务，按照之前的逻辑
+            maxx, cylinder_height = airspace_bounds
+            maxy = maxx
+            minx = -maxx
+            miny = -maxy
+            position = environment._spawn_on_surface()
+            target = environment._spawn_on_surface()
+            while np.linalg.norm(position - target) < 10.0:
+                target = np.array([random.uniform(minx, maxx),
+                                   random.uniform(miny, maxy),
+                                   random.uniform(environment.min_altitude, environment.max_altitude)])
+            uav = cls(drone_id=drone_id, position=position, target=target, optimal_speed=optimal_speed,
+                      task_type=task_type, cooperative=cooperative, uav_type=uav_type, emergency=emergency)
+            uav.environment = environment
+            return uav
+
+    def _generate_destination(self, uav_id):
+        # 生成目的地，根据任务类型
+        pass
 
     def calculate_takeoff_ring_heading(self):
         """
