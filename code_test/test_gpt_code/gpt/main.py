@@ -1,30 +1,23 @@
+# main.py
+
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from env import UrbanUAVEnv
-from agent import DQNAgent
-from definitions import MAX_ACCELERATION, DT
+from agent import MADDPGAgent
+from definitions import MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE
 import math
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
-import random
 
-# 超参数设置
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-GAMMA = 0.99
-EPSILON_START = 1.0
-EPSILON_END = 0.01
-EPSILON_DECAY = 5000
-TARGET_UPDATE_FREQUENCY = 10
-MEMORY_CAPACITY = 10000
-NUM_EPISODES = 500
+# 超参数
+BATCH_SIZE = 1024
+NUM_EPISODES = 5000
 MAX_STEPS_PER_EPISODE = 200
 
-# 设置保存模型和日志的路径
 SAVE_MODEL_PATH = './models'
-LOG_DIR = './runs/experiment1'
+LOG_DIR = './runs/experiment_maddpg'
 
 if not os.path.exists(SAVE_MODEL_PATH):
     os.makedirs(SAVE_MODEL_PATH)
@@ -33,105 +26,89 @@ if not os.path.exists(LOG_DIR):
 
 if __name__ == "__main__":
     env = UrbanUAVEnv()
-    num_agents = env.num_drones  # 无人机数量
-    state_dim = env.observation_space.shape[0]
-    action_dim = 125  # 动作维度：5 * 5 * 5
+    num_agents = env.num_drones  # 固定无人机数量
+    state_dim = env.observation_space.shape[0]  # 13
+    action_dim = env.action_space.shape[0]  # 3
+    agents = []
 
-    agents = [DQNAgent(state_dim, action_dim, learning_rate=LEARNING_RATE, gamma=GAMMA,
-                       epsilon_start=EPSILON_START, epsilon_end=EPSILON_END,
-                       epsilon_decay=EPSILON_DECAY, target_update_frequency=TARGET_UPDATE_FREQUENCY,
-                       memory_capacity=MEMORY_CAPACITY) for _ in range(num_agents)]
+    for i in range(num_agents):
+        agent = MADDPGAgent(
+            num_agents=num_agents,
+            agent_index=i,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            max_action=1.0  # 动作输出经过 tanh，取值范围 [-1, 1]
+        )
+        agents.append(agent)
+
     writer = SummaryWriter(log_dir=LOG_DIR)
 
-    plt.ion()  # 开启交互式模式
-
-    # 预填充经验回放池
-    PRE_FILL_STEPS = MEMORY_CAPACITY // 10  # 预填充 10% 的容量
-
-    print("Filling Replay Memory...")
-    for _ in tqdm(range(PRE_FILL_STEPS), desc='Filling Replay Memory'):
-        states = env.reset()
-        done = False
-        while not done:
-            actions = []
-            for i in range(num_agents):
-                action_index = random.randint(0, action_dim - 1)
-                idx_speed = action_index % 5
-                idx_heading = (action_index // 5) % 5
-                idx_altitude = (action_index // 25) % 5
-
-                delta_speed = np.linspace(-MAX_ACCELERATION, MAX_ACCELERATION, num=5)[idx_speed]
-                delta_heading = np.linspace(-math.pi / 4, math.pi / 4, num=5)[idx_heading]
-                delta_altitude = np.linspace(-5.0, 5.0, num=5)[idx_altitude]
-                env_action = {'delta_speed': delta_speed,
-                              'delta_heading': delta_heading,
-                              'delta_altitude': delta_altitude}
-                actions.append(env_action)
-            next_states, rewards, done, _ = env.step(actions)
-            for i, agent in enumerate(agents):
-                agent.memory.push(states[i], action_index, rewards[i], next_states[i], done)
-            states = next_states
+    plt.ion()
 
     for episode in tqdm(range(NUM_EPISODES), desc='Training'):
-        states = env.reset()
+        obs = env.reset()
         total_rewards = np.zeros(num_agents)
         episode_loss = 0.0
+
         for step in range(MAX_STEPS_PER_EPISODE):
             actions = []
-            for i, agent in enumerate(agents):
-                state = states[i]
-                action_index = agent.select_action(state)
-                # 动作索引转换为实际动作
-                idx_speed = action_index % 5
-                idx_heading = (action_index // 5) % 5
-                idx_altitude = (action_index // 25) % 5
-
-                delta_speed = np.linspace(-MAX_ACCELERATION, MAX_ACCELERATION, num=5)[idx_speed]
-                delta_heading = np.linspace(-math.pi / 4, math.pi / 4, num=5)[idx_heading]
-                delta_altitude = np.linspace(-5.0, 5.0, num=5)[idx_altitude]
-                env_action = {'delta_speed': delta_speed,
-                              'delta_heading': delta_heading,
-                              'delta_altitude': delta_altitude}
-                actions.append(env_action)
-
-            next_states, rewards, done, _ = env.step(actions)
+            observations = []
 
             for i, agent in enumerate(agents):
-                agent.memory.push(states[i], action_index, rewards[i], next_states[i], done)
-                loss = agent.optimize_model(BATCH_SIZE)
-                if loss is not None:
-                    episode_loss += loss.item()
-                total_rewards[i] += rewards[i]
+                state = obs[i]
+                action = agent.select_action(state)
+                # 添加探索噪声
+                noise = np.random.normal(0, 0.1, size=action_dim)
+                action = action + noise
+                # 限制动作范围
+                action = np.clip(action, -1.0, 1.0)
+                # 将动作映射到实际范围
+                real_action = action * np.array([MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE])
+                actions.append(real_action)
+                observations.append(state)
 
-            states = next_states
+            # 确保 actions 列表长度与无人机数量一致
+            if len(actions) < num_agents:
+                for _ in range(num_agents - len(actions)):
+                    actions.append(np.zeros(action_dim))
 
+            next_obs, rewards, dones, _ = env.step(actions)
+
+            # 存储经验到所有智能体的回放池
+            for i, agent in enumerate(agents):
+                agent.memory.push(
+                    obs,      # 所有智能体的观测
+                    actions,  # 所有智能体的动作
+                    rewards,  # 所有智能体的奖励
+                    next_obs,
+                    dones     # 每个智能体的完成状态
+                )
+
+            obs = next_obs
+            total_rewards += rewards
+
+            # 更新所有智能体
+            for agent in agents:
+                agent.update(agents, BATCH_SIZE)
+
+            # 渲染可视化
             if step % 10 == 0:
                 env.render()
 
-            if done:
+            if all(dones):
                 break
 
-        # 更新目标网络
-        if episode % TARGET_UPDATE_FREQUENCY == 0:
-            for agent in agents:
-                agent.update_target_network()
-
-        # 计算平均奖励和损失
         avg_reward = np.mean(total_rewards)
-        avg_loss = episode_loss / MAX_STEPS_PER_EPISODE
-
-        # 使用 TensorBoard 记录指标
         writer.add_scalar('Average Reward', avg_reward, episode)
         writer.add_scalar('Total Reward', np.sum(total_rewards), episode)
-        writer.add_scalar('Average Loss', avg_loss, episode)
 
-        # 输出日志
-        print(f'Episode {episode}, Average Reward: {avg_reward:.2f}, Total Reward: {np.sum(total_rewards):.2f}, Average Loss: {avg_loss:.4f}')
+        print(f'Episode {episode}, Average Reward: {avg_reward:.2f}, Total Reward: {np.sum(total_rewards):.2f}')
 
-        # 保存模型
-        if episode % 50 == 0:
+        # 每隔100轮保存模型
+        if episode % 100 == 0:
             for idx, agent in enumerate(agents):
-                torch.save(agent.policy_net.state_dict(), f'{SAVE_MODEL_PATH}/agent_{idx}_episode_{episode}.pth')
+                torch.save(agent.actor.state_dict(), f'{SAVE_MODEL_PATH}/agent_{idx}_actor_episode_{episode}.pth')
+                torch.save(agent.critic.state_dict(), f'{SAVE_MODEL_PATH}/agent_{idx}_critic_episode_{episode}.pth')
 
     env.close()
     writer.close()

@@ -2,7 +2,7 @@ import gym
 import numpy as np
 import random
 from typing import List, Dict
-from definitions import UAV, MAX_DRONES, MIN_DISTANCE, SENSING_RANGE, MAX_EPISODE_LEN, MAX_ACCELERATION, DT, NUM_MOVE
+from definitions_old import UAV, MAX_DRONES, MIN_DISTANCE, SENSING_RANGE, MAX_EPISODE_LEN, MAX_ACCELERATION, DT, NUM_MOVE
 import matplotlib.pyplot as plt
 
 
