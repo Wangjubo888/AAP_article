@@ -17,8 +17,9 @@ MIN_SAFE_DISTANCE_MATRIX = {
     # ... （其他组合，您可以根据需要补充）
 }
 
-MAX_SPEED = 20.0
-MIN_SPEED = 5.0
+MAX_SPEED = 80.0
+MIN_SPEED = 10.0
+Cruise_SPEED = 10.0
 MAX_ACCELERATION = 5.0
 MAX_TURN_RATE = 30.0  # 每秒最大转向角度（度）
 MAX_CLIMB_RATE = 5.0  # 每秒最大爬升/下降速度
