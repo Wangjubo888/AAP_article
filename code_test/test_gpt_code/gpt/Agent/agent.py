@@ -7,14 +7,13 @@ import torch.optim as optim
 import random
 from collections import deque
 
-
-# 神经网络定义
+# Actor 网络
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, max_action):
         super(Actor, self).__init__()
-        self.l1 = nn.Linear(state_dim, 128)
-        self.l2 = nn.Linear(128, 128)
-        self.l3 = nn.Linear(128, action_dim)
+        self.l1 = nn.Linear(state_dim, 512)
+        self.l2 = nn.Linear(512, 256)
+        self.l3 = nn.Linear(256, action_dim)
         self.max_action = max_action
 
     def forward(self, state):
@@ -23,12 +22,12 @@ class Actor(nn.Module):
         a = torch.tanh(self.l3(a))
         return a * self.max_action
 
-
+# Critic 网络
 class Critic(nn.Module):
     def __init__(self, total_state_dim, total_action_dim):
         super(Critic, self).__init__()
-        self.l1 = nn.Linear(total_state_dim + total_action_dim, 256)
-        self.l2 = nn.Linear(256, 256)
+        self.l1 = nn.Linear(total_state_dim + total_action_dim, 512)
+        self.l2 = nn.Linear(512, 256)
         self.l3 = nn.Linear(256, 1)
 
     def forward(self, states, actions):
@@ -37,7 +36,6 @@ class Critic(nn.Module):
         x = torch.relu(self.l2(x))
         x = self.l3(x)
         return x
-
 
 # 经验回放池
 class ReplayMemory:
@@ -53,7 +51,6 @@ class ReplayMemory:
 
     def __len__(self):
         return len(self.memory)
-
 
 # MADDPG智能体
 class MADDPGAgent:
@@ -75,7 +72,7 @@ class MADDPGAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-3)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-3)
 
-        self.memory = ReplayMemory(1000)
+        self.memory = ReplayMemory(1000000)
         self.gamma = 0.95
         self.tau = 0.01
 
@@ -129,12 +126,12 @@ class MADDPGAgent:
         actions_pred = []
         for agent in agents:
             idx = agent.agent_index
-            state_i = states[:, idx * self.state_dim:(idx + 1)*self.state_dim]
+            state_i = states[:, idx * self.state_dim:(idx +1)*self.state_dim]
             if agent.agent_index == self.agent_index:
                 a_i = self.actor(state_i)
             else:
                 # Use the current actions stored in the batch
-                a_i = actions[:, idx * self.action_dim:(idx + 1)*self.action_dim]
+                a_i = actions[:, idx * self.action_dim:(idx +1)*self.action_dim]
             actions_pred.append(a_i)
         actions_pred = torch.cat(actions_pred, dim=1)
         actor_loss = -self.critic(states, actions_pred).mean()

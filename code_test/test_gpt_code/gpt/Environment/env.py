@@ -3,20 +3,21 @@
 import gym
 import numpy as np
 import random
-from typing import List, Dict
-from definitions import UAV, MIN_SAFE_DISTANCE_MATRIX, UAV_TYPES, MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE, DT, \
-    R1, R2, R3, H1, H2, MAX_ALTITUDE
+from typing import List
+from definitions import UAV, MIN_SAFE_DISTANCE_MATRIX, UAV_TYPES, UAV_OPTIMAL_SPEED, MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE, DT, R1, R2, R3, H1, H2, MAX_ALTITUDE, TAKEOFF_RING_CAPACITY, LANDING_RING_CAPACITY
 import math
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-
+from vispy import app, scene
+from vispy.scene import visuals
+from vispy.visuals import MeshVisual
+from vispy.color import get_colormap
+import time
 
 class UrbanUAVEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(self):
         super(UrbanUAVEnv, self).__init__()
-        self.num_drones = 5  # 调整为与起飞垫数量一致
+        self.num_drones = 5  # 调整为所需的无人机数量
         self.drones = []
         self.time_step = 0
         self.max_time_steps = 200
@@ -30,7 +31,9 @@ class UrbanUAVEnv(gym.Env):
         )
 
         # 定义观测空间
-        state_dim = 13  # [position(3), velocity(3), energy(1), type_info(1), cooperative_flag(1), priority_info(1), neighbors(3)]
+        num_nearest = 3
+        self.num_nearest = num_nearest
+        state_dim = 10 + num_nearest * 6  # [原来的13维 + 邻居信息]
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -44,60 +47,95 @@ class UrbanUAVEnv(gym.Env):
         self.R3 = R3
         self.H1 = H1
         self.H2 = H2
+        self.airspace_radius = self.R3
+        self.approach_area_radius = self.R2
 
-        # 起飞和降落场
-        self.takeoff_pads = {
-            0: {'position': np.array([-R1, -R1, 0.0]), 'status': 'available'},
-            1: {'position': np.array([R1, -R1, 0.0]), 'status': 'available'},
-            2: {'position': np.array([-R1, R1, 0.0]), 'status': 'available'},
-            3: {'position': np.array([R1, R1, 0.0]), 'status': 'available'},
-            4: {'position': np.array([0.0, 0.0, 0.0]), 'status': 'available'},
-        }
-        self.landing_pads = {
-            0: {'position': np.array([-R1 / 2, R1 / 2, 0.0]), 'status': 'available'},
-            1: {'position': np.array([R1 / 2, -R1 / 2, 0.0]), 'status': 'available'},
-        }
+        # 起飞和降落区域（四个关于原点对称的圆形区域）
+        self.takeoff_areas = [
+            {'center': np.array([-R1, -R1, 0.0]), 'radius': R1 / 2},
+            {'center': np.array([R1, -R1, 0.0]), 'radius': R1 / 2},
+            {'center': np.array([-R1, R1, 0.0]), 'radius': R1 / 2},
+            {'center': np.array([R1, R1, 0.0]), 'radius': R1 / 2},
+        ]
+
+        self.landing_areas = [
+            {'center': np.array([-R1, 0.0, 0.0]), 'radius': R1 / 2},
+            {'center': np.array([R1, 0.0, 0.0]), 'radius': R1 / 2},
+            {'center': np.array([0.0, -R1, 0.0]), 'radius': R1 / 2},
+            {'center': np.array([0.0, R1, 0.0]), 'radius': R1 / 2},
+        ]
 
         # 环和中心
         self.takeoff_ring_center = np.array([0.0, 0.0, self.H1])
         self.landing_ring_center = np.array([0.0, 0.0, self.H2])
 
-        # 进近区域和空域
-        self.approach_area_radius = self.R2
-        self.airspace_radius = self.R3
+        # 进近队列
+        self.approach_queue: List[UAV] = []
 
-        # 降落序号计数器
-        self.landing_sequence = 0
+        # 紧急无人机标志
+        self.emergency_uav_exists = False
 
         self.done_drones = set()
+
+        # 环内的无人机列表
+        self.takeoff_ring_uavs: List[UAV] = []
+        self.landing_ring_uavs: List[UAV] = []
+
         self.reset()
 
-        # 初始化渲染标志和图形对象
-        self.viewer_initialized = False
-        self.fig = None
-        self.ax = None
+        # 初始化 VisPy 画布
+        self.canvas = scene.SceneCanvas(keys='interactive', show=True, bgcolor='white')
+        self.view = self.canvas.central_widget.add_view()
+        self.view.camera = scene.cameras.TurntableCamera(elevation=30, azimuth=30)
+        self.view.camera.fov = 60
+        self.view.camera.distance = self.R3 * 2.0
+
+        # 添加标记器用于无人机
+        self.markers = visuals.Markers()
+        self.view.add(self.markers)
+
+        # 添加轨迹线
+        self.traces = []
+        for _ in range(self.num_drones):
+            line = visuals.Line(color='black', width=1)
+            self.view.add(line)
+            self.traces.append(line)
+
+        # 设置颜色映射
+        self.colormap = get_colormap('viridis')
+
+        # 添加起飞环和降落环的可视化
+        self.draw_rings()
+
+        # 添加空域的可视化
+        self.draw_airspace()
+
+        # 添加起飞和降落区域的可视化
+        self.draw_areas()
+
+        # 启动事件循环
+        self.app = app.Application()
+        self.timer = app.Timer(0.1, connect=self.on_timer, start=True)
+
+    def on_timer(self, event):
+        pass  # 需要处理时可以添加逻辑
 
     def reset(self):
         self.drones = []
         self.done_drones = set()
-        self.landing_sequence = 0
+        self.approach_queue = []
+        self.emergency_uav_exists = False
+        self.time_step = 0
+        self.takeoff_ring_uavs = []
+        self.landing_ring_uavs = []
 
-        for pad in self.takeoff_pads.values():
-            pad['status'] = 'available'
-        for pad in self.landing_pads.values():
-            pad['status'] = 'available'
-
-        # 分配任务：优先分配 'takeoff' 任务，确保所有需要起飞的无人机都能获得起飞垫
+        # 只生成执行起飞或降落任务的无人机
         for i in range(self.num_drones):
-            if i < len(self.takeoff_pads):
-                task_type = 'takeoff'
-            else:
-                task_type = random.choice(['landing', 'cruise'])
+            task_type = random.choice(['takeoff', 'landing'])
             drone = UAV.random_uav(drone_id=i, task_type=task_type, environment=self)
             if drone:
                 self.drones.append(drone)
 
-        self.time_step = 0
         return self._get_observation()
 
     def step(self, actions: List[np.ndarray]):
@@ -111,14 +149,13 @@ class UrbanUAVEnv(gym.Env):
                     action = actions[i]
                 else:
                     action = np.zeros(self.action_space.shape[0])  # 默认动作
-                other_drones = [d for idx, d in enumerate(self.drones) if idx != i]
-                drone.step(action, other_drones)
+                drone.step(action, self.drones)
                 if drone.task_finished or drone.energy <= 0:
                     self.done_drones.add(i)
 
         self.time_step += 1
-        self._update_pads_status()
-        self._update_collisions()
+        self._apply_collision_avoidance()
+
         rewards = self._compute_rewards()
         obs = self._get_observation()
 
@@ -128,16 +165,54 @@ class UrbanUAVEnv(gym.Env):
         done = False  # 环境的全局完成状态，如果需要可以保持为False
         return obs, rewards, dones, infos
 
+    def _apply_collision_avoidance(self):
+        # 在这里实现避撞逻辑
+        for i, drone in enumerate(self.drones):
+            if i in self.done_drones:
+                continue
+            # 获取附近的无人机
+            neighbors = self._get_nearest_neighbors(drone, self.num_nearest)
+            for neighbor in neighbors:
+                if neighbor.drone_id in self.done_drones:
+                    continue
+                distance_vector = neighbor.position - drone.position
+                distance = np.linalg.norm(distance_vector)
+                min_distance = MIN_SAFE_DISTANCE_MATRIX.get((drone.type, neighbor.type), 10.0)
+                if distance < min_distance:
+                    # 发生碰撞
+                    drone.r_collision = 1
+                    neighbor.r_collision = 1
+                    self.done_drones.add(i)
+                    self.done_drones.add(self.drones.index(neighbor))
+                elif distance < min_distance + 10.0:
+                    # 接近碰撞，需要避让
+                    if drone.cooperative:
+                        # 调整航向角远离邻近无人机
+                        avoidance_direction = -distance_vector / (distance + 1e-6)
+                        angle_adjustment = np.rad2deg(np.arctan2(avoidance_direction[1], avoidance_direction[0])) - drone.heading_angle
+                        angle_adjustment = np.clip(angle_adjustment, -MAX_TURN_RATE * DT, MAX_TURN_RATE * DT)
+                        drone.heading_angle += angle_adjustment
+                        drone.heading_angle = drone.heading_angle % 360
+                        drone.avoided_collision = True
+                    else:
+                        # 非合作无人机不采取避让动作
+                        pass
+
     def _compute_rewards(self):
         rewards = []
         for i, drone in enumerate(self.drones):
             reward = 0.0
             if drone.r_task_completion:
                 reward += 100.0  # 任务完成奖励
+
+            # 奖励或惩罚无人机保持最优速度
+            speed_diff = abs(drone.speed - UAV_OPTIMAL_SPEED[drone.type])
+            reward -= speed_diff * 0.5  # 惩罚速度偏离
+
             if drone.avoided_collision:
-                reward += 5.0  # 成功避让奖励
+                reward += 10.0   # 成功避让奖励
             if drone.r_collision:
-                reward -= 100.0  # 碰撞惩罚
+                reward -= 200.0 # 碰撞惩罚
             if drone.violation:
                 reward -= 50.0  # 违规惩罚
             reward -= drone.energy_consumption * 0.1  # 能量消耗惩罚
@@ -154,173 +229,176 @@ class UrbanUAVEnv(gym.Env):
             type_info = np.array([type_index])
             cooperative_flag = np.array([1.0 if drone.cooperative else 0.0])
             priority_info = np.array([drone.priority])
-            neighbors = self._get_neighbors(drone)
-            observation = np.concatenate(
-                [position, velocity, energy, type_info, cooperative_flag, priority_info, neighbors])
+
+            # 获取最近的邻居信息
+            neighbors_info = self._get_neighbors_info(drone)
+
+            observation = np.concatenate([position, velocity, energy, type_info, cooperative_flag, priority_info, neighbors_info])
             obs.append(observation)
         return obs
 
-    def _get_neighbors(self, drone):
-        closest_distance = float('inf')
-        neighbor_info = np.zeros(3)
+    def _get_neighbors_info(self, drone):
+        neighbors = self._get_nearest_neighbors(drone, self.num_nearest)
+        info = []
+        for neighbor in neighbors:
+            relative_position = neighbor.position - drone.position
+            relative_velocity = (neighbor.speed * neighbor.heading) - (drone.speed * drone.heading)
+            info.extend(relative_position)
+            info.extend(relative_velocity)
+        # 如果邻居数量不足，填充0
+        if len(neighbors) < self.num_nearest:
+            for _ in range(self.num_nearest - len(neighbors)):
+                info.extend([0.0]*6)
+        return np.array(info)
+
+    def _get_nearest_neighbors(self, drone, num_neighbors):
+        distances = []
         for other_drone in self.drones:
             if other_drone.drone_id != drone.drone_id:
                 distance = np.linalg.norm(drone.position - other_drone.position)
-                if distance < 100.0 and distance < closest_distance:
-                    closest_distance = distance
-                    relative_position = other_drone.position - drone.position
-                    neighbor_info = relative_position
-        return neighbor_info
+                distances.append((distance, other_drone))
+        distances.sort(key=lambda x: x[0])
+        neighbors = [item[1] for item in distances[:num_neighbors]]
+        return neighbors
 
-    def _update_pads_status(self):
-        # 更新起飞垫
-        for drone in self.drones:
-            if drone.task_type == 'takeoff' and drone.taking_off:
-                pad_id = drone.assigned_pad
-                if pad_id is not None and self.takeoff_pads[pad_id]['status'] == 'occupied':
-                    if drone.altitude > 10.0:
-                        self.takeoff_pads[pad_id]['status'] = 'available'
+    def can_ascend_to_takeoff_ring(self):
+        # 检查起飞环容量是否未达到上限
+        return len(self.takeoff_ring_uavs) < TAKEOFF_RING_CAPACITY
 
-        # 更新降落垫
-        for drone in self.drones:
-            if drone.task_type == 'landing' and drone.task_finished:
-                pad_id = drone.assigned_pad
-                if pad_id is not None and self.landing_pads[pad_id]['status'] == 'occupied':
-                    self.landing_pads[pad_id]['status'] = 'available'
+    def enter_takeoff_ring(self, drone: UAV):
+        self.takeoff_ring_uavs.append(drone)
 
-    def _update_collisions(self):
-        for drone in self.drones:
-            drone.r_collision = 0
+    def can_enter_landing_ring(self, drone: UAV):
+        # 检查降落环容量是否未达到上限，并根据优先级顺序允许进入
+        if len(self.landing_ring_uavs) < LANDING_RING_CAPACITY:
+            if self.approach_queue and self.approach_queue[0] == drone:
+                return True
+        return False
 
-        for i, drone in enumerate(self.drones):
-            for j, other_drone in enumerate(self.drones):
-                if j > i:
-                    if self.check_collision(drone, other_drone):
-                        drone.r_collision = 1
-                        other_drone.r_collision = 1
-                        self.done_drones.add(i)
-                        self.done_drones.add(j)
+    def enter_landing_ring(self, drone: UAV):
+        self.landing_ring_uavs.append(drone)
+        if drone in self.approach_queue:
+            self.approach_queue.remove(drone)
 
-    def check_collision(self, drone1: UAV, drone2: UAV) -> bool:
-        type_pair = (drone1.type, drone2.type)
-        min_distance = MIN_SAFE_DISTANCE_MATRIX.get(type_pair, 10.0)
-        distance = np.linalg.norm(drone1.position - drone2.position)
-        return distance < min_distance
+    def can_land(self, drone: UAV):
+        # 检查是否可以降落
+        return True  # 这里不再限制降落停机坪，可直接降落在降落区域内
 
-    def get_idle_takeoff_pads(self):
-        return [pad_id for pad_id, pad in self.takeoff_pads.items() if pad['status'] == 'available']
+    def get_landing_point(self, drone: UAV):
+        # 在降落区域内随机选择一个点
+        area = random.choice(self.landing_areas)
+        angle = random.uniform(0, 2 * np.pi)
+        radius = random.uniform(0, area['radius'])
+        x = area['center'][0] + radius * np.cos(angle)
+        y = area['center'][1] + radius * np.sin(angle)
+        z = 0.0
+        return np.array([x, y, z])
 
-    def get_idle_landing_pads(self):
-        return [pad_id for pad_id, pad in self.landing_pads.items() if pad['status'] == 'available']
+    def finish_landing(self, drone: UAV):
+        if drone in self.landing_ring_uavs:
+            self.landing_ring_uavs.remove(drone)
 
-    def assign_landing_pad(self, drone):
-        idle_pads = self.get_idle_landing_pads()
-        if idle_pads:
-            pad_id = idle_pads[0]
-            self.landing_pads[pad_id]['status'] = 'occupied'
-            return pad_id
-        else:
-            return None
+    def has_emergency_uav(self):
+        return self.emergency_uav_exists
 
-    def has_idle_landing_pad(self):
-        return bool(self.get_idle_landing_pads())
-
-    def get_next_landing_sequence(self):
-        self.landing_sequence += 1
-        return self.landing_sequence
+    def set_emergency_uav_exists(self, exists: bool):
+        self.emergency_uav_exists = exists
 
     def approach_area_center(self):
         return np.array([0.0, 0.0, self.H2])
 
-    def render(self, mode='human'):
-        if not self.viewer_initialized:
-            self.fig = plt.figure(figsize=(12, 10))
-            self.ax = self.fig.add_subplot(111, projection='3d')
-            self.viewer_initialized = True
+    def add_to_approach_queue(self, drone: UAV):
+        # 紧急无人机插入队列最前面
+        if drone.emergency:
+            self.approach_queue.insert(0, drone)
+            drone.priority = 999  # 紧急无人机最高优先级
+        else:
+            self.approach_queue.append(drone)
+            # 优先级根据进入进近空域的时间分配，进入越早，优先级越高
+            drone.priority = -drone.entered_approach_time  # 时间越小，值越大
 
-        self.ax.cla()  # 清空之前的绘图内容
-
-        # 绘制外空域（R3）
-        u = np.linspace(0, 2 * np.pi, 100)
-        v = np.linspace(0, np.pi, 100)
-        x = self.R3 * np.outer(np.cos(u), np.sin(v))
-        y = self.R3 * np.outer(np.sin(u), np.sin(v))
-        z = self.R3 * np.outer(np.ones(np.size(u)), np.cos(v))
-        self.ax.plot_wireframe(x, y, z, color='grey', alpha=0.1)
-
-        # 绘制进近空域（R2）
-        x_inner = self.R2 * np.outer(np.cos(u), np.sin(v))
-        y_inner = self.R2 * np.outer(np.sin(u), np.sin(v))
-        z_inner = self.R2 * np.outer(np.ones(np.size(u)), np.cos(v))
-        self.ax.plot_wireframe(x_inner, y_inner, z_inner, color='green', alpha=0.1)
-
+    def draw_rings(self):
         # 绘制起飞环
         theta = np.linspace(0, 2 * np.pi, 100)
-        x_takeoff = self.R1 * np.cos(theta)
-        y_takeoff = self.R1 * np.sin(theta)
-        z_takeoff = np.ones_like(x_takeoff) * self.H1
-        self.ax.plot(x_takeoff, y_takeoff, z_takeoff, color='blue', linestyle='--', label='Takeoff Ring')
+        x = self.takeoff_ring_center[0] + self.R1 * np.cos(theta)
+        y = self.takeoff_ring_center[1] + self.R1 * np.sin(theta)
+        z = np.full_like(x, self.H1)
+        takeoff_ring = np.vstack((x, y, z)).T
+        line1 = visuals.Line(pos=takeoff_ring, color='blue', width=2)
+        self.view.add(line1)
 
         # 绘制降落环
-        z_landing = np.ones_like(x_takeoff) * self.H2
-        self.ax.plot(x_takeoff, y_takeoff, z_landing, color='orange', linestyle='--', label='Landing Ring')
+        x = self.landing_ring_center[0] + self.R1 * np.cos(theta)
+        y = self.landing_ring_center[1] + self.R1 * np.sin(theta)
+        z = np.full_like(x, self.H2)
+        landing_ring = np.vstack((x, y, z)).T
+        line2 = visuals.Line(pos=landing_ring, color='green', width=2)
+        self.view.add(line2)
 
-        # 绘制起飞垫
-        for pad_id, pad in self.takeoff_pads.items():
-            pos = pad['position']
-            self.ax.scatter(pos[0], pos[1], pos[2], color='blue', marker='s', s=100,
-                            label='Takeoff Pad' if pad_id == 0 else "")
+    def draw_airspace(self):
+        # 绘制外部空域（仅绘制底部圆圈作为参考）
+        theta = np.linspace(0, 2 * np.pi, 100)
+        x = self.airspace_radius * np.cos(theta)
+        y = self.airspace_radius * np.sin(theta)
+        z = np.zeros_like(x)
+        airspace_circle = np.vstack((x, y, z)).T
+        line = visuals.Line(pos=airspace_circle, color='gray', width=1)
+        self.view.add(line)
 
-        # 绘制降落垫
-        for pad_id, pad in self.landing_pads.items():
-            pos = pad['position']
-            self.ax.scatter(pos[0], pos[1], pos[2], color='orange', marker='s', s=100,
-                            label='Landing Pad' if pad_id == 0 else "")
+    def draw_areas(self):
+        # 绘制起飞区域
+        for area in self.takeoff_areas:
+            theta = np.linspace(0, 2 * np.pi, 100)
+            x = area['center'][0] + area['radius'] * np.cos(theta)
+            y = area['center'][1] + area['radius'] * np.sin(theta)
+            z = np.full_like(x, 0.0)
+            pos = np.vstack((x, y, z)).T
+            line = visuals.Line(pos=pos, color='blue', width=1)
+            self.view.add(line)
 
-        # 绘制无人机和轨迹
+        # 绘制降落区域
+        for area in self.landing_areas:
+            theta = np.linspace(0, 2 * np.pi, 100)
+            x = area['center'][0] + area['radius'] * np.cos(theta)
+            y = area['center'][1] + area['radius'] * np.sin(theta)
+            z = np.full_like(x, 0.0)
+            pos = np.vstack((x, y, z)).T
+            line = visuals.Line(pos=pos, color='green', width=1)
+            self.view.add(line)
+
+    def render(self, mode='human'):
+        # 准备无人机的位置和颜色
+        positions = []
+        colors = []
         for drone in self.drones:
-            positions = np.array(drone.position_history)
-            if positions.shape[0] > 1:
-                if drone.task_type == 'takeoff':
-                    color = 'cyan'
-                    marker = 'o'
-                elif drone.task_type == 'landing':
-                    color = 'magenta'
-                    marker = '^'
-                else:
-                    color = 'red' if not drone.cooperative else 'green'
-                    marker = 's'
-                self.ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], color=color, linewidth=1)
-            # 绘制无人机当前位置
+            positions.append(drone.position)
             if drone.task_type == 'takeoff':
-                color = 'cyan'
-                marker = 'o'
+                colors.append([0, 1, 1, 1])  # 青色
             elif drone.task_type == 'landing':
-                color = 'magenta'
-                marker = '^'
+                if drone.emergency:
+                    colors.append([1, 0, 0, 1])  # 红色表示紧急无人机
+                else:
+                    colors.append([1, 0, 1, 1])  # 品红色
             else:
-                color = 'red' if not drone.cooperative else 'green'
-                marker = 's'
-            self.ax.scatter(drone.position[0], drone.position[1], drone.position[2], color=color, marker=marker, s=50)
+                colors.append([0.5, 0.5, 0.5, 1])  # 灰色
 
-        # 设置图形参数
-        self.ax.set_xlim([-self.R3, self.R3])
-        self.ax.set_ylim([-self.R3, self.R3])
-        self.ax.set_zlim([0, MAX_ALTITUDE])
-        self.ax.set_xlabel('X')
-        self.ax.set_ylabel('Y')
-        self.ax.set_zlabel('Z')
-        self.ax.set_title(f'Time Step: {self.time_step}')
+        positions = np.array(positions)
+        colors = np.array(colors)
 
-        # 创建图例，避免重复
-        handles, labels = self.ax.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        self.ax.legend(by_label.values(), by_label.keys())
+        # 更新无人机标记
+        self.markers.set_data(positions[:, :3], face_color=colors, size=10)
 
-        plt.draw()
-        plt.pause(0.001)
+        # 更新轨迹
+        max_trace_length = 100  # 仅绘制最近的100个位置点
+        for idx, drone in enumerate(self.drones):
+            if len(drone.position_history) > 1:
+                trace = np.array(drone.position_history[-max_trace_length:])
+                self.traces[idx].set_data(pos=trace[:, :3], width=1, color='black')  # X, Y, Z
+
+        # 更新画布
+        self.canvas.update()
+        time.sleep(0.01)  # 控制渲染速度
 
     def close(self):
-        if self.viewer_initialized:
-            plt.close(self.fig)
-            self.viewer_initialized = False
+        if hasattr(self, 'canvas'):
+            self.canvas.close()

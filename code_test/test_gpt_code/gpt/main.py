@@ -8,7 +8,6 @@ from agent import MADDPGAgent
 from definitions import MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE
 import math
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import os
 
 # 超参数
@@ -27,7 +26,7 @@ if not os.path.exists(LOG_DIR):
 if __name__ == "__main__":
     env = UrbanUAVEnv()
     num_agents = env.num_drones  # 固定无人机数量
-    state_dim = env.observation_space.shape[0]  # 13
+    state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]  # 3
     agents = []
 
@@ -42,8 +41,6 @@ if __name__ == "__main__":
         agents.append(agent)
 
     writer = SummaryWriter(log_dir=LOG_DIR)
-
-    plt.ion()
 
     for episode in tqdm(range(NUM_EPISODES), desc='Training'):
         obs = env.reset()
@@ -112,6 +109,3 @@ if __name__ == "__main__":
 
     env.close()
     writer.close()
-
-    plt.ioff()
-    plt.show()
