@@ -12,7 +12,7 @@ import os
 
 # 超参数
 BATCH_SIZE = 1024
-NUM_EPISODES = 5000
+NUM_EPISODES = 10  # 根据需要调整回合数
 MAX_STEPS_PER_EPISODE = 200
 
 SAVE_MODEL_PATH = './models'
@@ -36,12 +36,13 @@ if __name__ == "__main__":
             agent_index=i,
             state_dim=state_dim,
             action_dim=action_dim,
-            max_action=1.0  # 动作输出经过 tanh，取值范围 [-1, 1]
+            max_action=1.0  # 动作输出范围 [-1, 1]
         )
         agents.append(agent)
 
     writer = SummaryWriter(log_dir=LOG_DIR)
 
+    # 训练循环
     for episode in tqdm(range(NUM_EPISODES), desc='Training'):
         obs = env.reset()
         total_rewards = np.zeros(num_agents)
@@ -64,33 +65,24 @@ if __name__ == "__main__":
                 actions.append(real_action)
                 observations.append(state)
 
-            # 确保 actions 列表长度与无人机数量一致
-            if len(actions) < num_agents:
-                for _ in range(num_agents - len(actions)):
-                    actions.append(np.zeros(action_dim))
-
             next_obs, rewards, dones, _ = env.step(actions)
 
-            # 存储经验到所有智能体的回放池
+            # 存储经验
             for i, agent in enumerate(agents):
                 agent.memory.push(
-                    obs,      # 所有智能体的观测
-                    actions,  # 所有智能体的动作
-                    rewards,  # 所有智能体的奖励
+                    obs,
+                    actions,
+                    rewards,
                     next_obs,
-                    dones     # 每个智能体的完成状态
+                    dones
                 )
 
             obs = next_obs
             total_rewards += rewards
 
-            # 更新所有智能体
+            # 更新智能体
             for agent in agents:
                 agent.update(agents, BATCH_SIZE)
-
-            # 渲染可视化
-            if step % 10 == 0:
-                env.render()
 
             if all(dones):
                 break
@@ -100,6 +92,9 @@ if __name__ == "__main__":
         writer.add_scalar('Total Reward', np.sum(total_rewards), episode)
 
         print(f'Episode {episode}, Average Reward: {avg_reward:.2f}, Total Reward: {np.sum(total_rewards):.2f}')
+
+        # 在回合结束后，生成动画
+        env.render_episode(episode)
 
         # 每隔100轮保存模型
         if episode % 100 == 0:

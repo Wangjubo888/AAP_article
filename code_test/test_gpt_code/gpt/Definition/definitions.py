@@ -6,9 +6,11 @@ from typing import Optional, List
 import random
 
 # 常量和参数
+
+# 无人机类型
 UAV_TYPES = ['multirotor', 'light_hybrid_wing', 'medium_hybrid_wing', 'heavy_hybrid_wing']
 
-# 不同类型无人机的最优速度（根据需求设定）
+# 不同类型无人机的最优速度（单位：m/s）
 UAV_OPTIMAL_SPEED = {
     'multirotor': 10.0,
     'light_hybrid_wing': 15.0,
@@ -16,31 +18,43 @@ UAV_OPTIMAL_SPEED = {
     'heavy_hybrid_wing': 25.0,
 }
 
+# 不同类型无人机之间的最小安全距离矩阵（单位：米）
 MIN_SAFE_DISTANCE_MATRIX = {
     ('multirotor', 'multirotor'): 10.0,
     ('multirotor', 'light_hybrid_wing'): 15.0,
     ('multirotor', 'medium_hybrid_wing'): 20.0,
     ('multirotor', 'heavy_hybrid_wing'): 25.0,
-    # ... （其他组合，您可以根据需要补充）
+    ('light_hybrid_wing', 'light_hybrid_wing'): 15.0,
+    ('light_hybrid_wing', 'medium_hybrid_wing'): 20.0,
+    ('light_hybrid_wing', 'heavy_hybrid_wing'): 25.0,
+    ('medium_hybrid_wing', 'medium_hybrid_wing'): 20.0,
+    ('medium_hybrid_wing', 'heavy_hybrid_wing'): 25.0,
+    ('heavy_hybrid_wing', 'heavy_hybrid_wing'): 25.0,
+    # 对称填充矩阵
 }
+# 填充对称的矩阵值
+for (type1, type2), distance in list(MIN_SAFE_DISTANCE_MATRIX.items()):
+    if (type2, type1) not in MIN_SAFE_DISTANCE_MATRIX:
+        MIN_SAFE_DISTANCE_MATRIX[(type2, type1)] = distance
 
-MAX_ACCELERATION = 5.0
-MAX_TURN_RATE = 30.0  # 每秒最大转向角度（度）
-MAX_CLIMB_RATE = 5.0  # 每秒最大爬升/下降速度
-DT = 1.0
+# 动作限制参数
+MAX_ACCELERATION = 5.0  # 最大加速度（m/s^2）
+MAX_TURN_RATE = 30.0    # 每秒最大转向角度（度）
+MAX_CLIMB_RATE = 5.0    # 每秒最大爬升/下降速度（m/s）
+DT = 1.0                # 时间步长（秒）
 
 # 空域参数
-R1 = 100.0   # 起飞/降落场和环的半径
-R2 = 150.0   # 进近区域的半径（R2 > R1）
-R3 = 300.0   # 外部空域的半径
-H1 = 120.0   # 起飞环的高度
-H2 = 80.0    # 降落环的高度
-MAX_ALTITUDE = 1500.0  # 空域的最大高度
+R1 = 100.0    # 起飞/降落环的半径（米）
+R2 = 150.0    # 进近区域的半径（米），R2 > R1
+R3 = 300.0    # 外部空域的半径（米）
+H1 = 120.0    # 起飞环的高度（米）
+H2 = 80.0     # 降落环的高度（米）
+MAX_ALTITUDE = 1500.0   # 空域的最大高度（米）
 
-TAKEOFF_RING_CAPACITY = 5  # 起飞环容量
-LANDING_RING_CAPACITY = 5  # 降落环容量
+TAKEOFF_RING_CAPACITY = 5   # 起飞环容量（同时容纳的无人机数量）
+LANDING_RING_CAPACITY = 5   # 降落环容量
 
-PAD_COOLDOWN_TIME = 10  # 停机坪冷却时间
+PAD_COOLDOWN_TIME = 10  # 停机坪冷却时间（秒）
 
 @dataclass
 class UAV:
@@ -84,11 +98,11 @@ class UAV:
     target_point: Optional[np.ndarray] = field(default=None, init=False)  # 最终目标点
 
     def __post_init__(self):
-        self.speed = 0.0  # 初始化速度为0
+        self.speed = 0.0  # 初始化速度为 0
         self.heading = np.array([0.0, 0.0, 0.0])
         self.heading_angle = 0.0
         self.altitude = self.position[2]
-        self.energy = 100.0
+        self.energy = 100.0  # 初始能量
         self.path_length = 0.0
         self.environment = None  # 将在环境中设置
         # 初始化位置历史
@@ -106,7 +120,7 @@ class UAV:
         delta_climb = action[2]
 
         # 更新无人机速度
-        self.speed = np.clip(self.speed + delta_speed * DT, 0.0, UAV_OPTIMAL_SPEED[self.type] * 1.5)  # 限制最大速度为最优速度的1.5倍
+        self.speed = np.clip(self.speed + delta_speed * DT, 0.0, UAV_OPTIMAL_SPEED[self.type] * 1.5)  # 限制最大速度为最优速度的 1.5 倍
 
         # 更新无人机航向角
         self.heading_angle += delta_turn * DT
@@ -186,7 +200,7 @@ class UAV:
     def handle_landing_task(self):
         if not self.entered_approach_time:
             # 向进近空域飞行
-            self.target = self.environment.approach_area_center()
+            self.target = self.environment.get_approach_area_center()
             self.update_heading_towards_target()
             if self.in_approach_area():
                 self.entered_approach_time = self.environment.time_step
@@ -231,7 +245,7 @@ class UAV:
         # 沿环飞行，顺时针方向
         relative_pos = self.position - center
         angle = np.arctan2(relative_pos[1], relative_pos[0])
-        angle -= np.deg2rad(10.0) * DT  # 每秒转动10度
+        angle -= np.deg2rad(10.0) * DT  # 每秒转动 10 度
         new_x = center[0] + radius * np.cos(angle)
         new_y = center[1] + radius * np.sin(angle)
         self.target = np.array([new_x, new_y, self.altitude])
@@ -270,7 +284,7 @@ class UAV:
             self.target_point = np.array([x_outer, y_outer, z_outer])
 
     def in_approach_area(self):
-        distance = np.linalg.norm(self.position[:2] - self.environment.approach_area_center()[:2])
+        distance = np.linalg.norm(self.position[:2] - self.environment.get_approach_area_center()[:2])
         return distance <= self.environment.approach_area_radius
 
     def has_reached_target(self) -> bool:
@@ -298,12 +312,12 @@ class UAV:
                 emergency = False
 
         if task_type == 'takeoff':
-            # 在可用的起飞区域内随机生成位置
-            area = random.choice(environment.takeoff_areas)
+            # 在起飞停机坪内随机生成位置
+            pad = random.choice(environment.takeoff_pads)
             angle = random.uniform(0, 2 * np.pi)
-            radius = random.uniform(0, area['radius'])
-            x = area['center'][0] + radius * np.cos(angle)
-            y = area['center'][1] + radius * np.sin(angle)
+            radius = random.uniform(0, pad['radius'])
+            x = pad['center'][0] + radius * np.cos(angle)
+            y = pad['center'][1] + radius * np.sin(angle)
             position = np.array([x, y, 0.0])
             drone = cls(drone_id=drone_id, position=position, target=None, optimal_speed=optimal_speed,
                         task_type=task_type, cooperative=cooperative, type=uav_type, emergency=emergency)

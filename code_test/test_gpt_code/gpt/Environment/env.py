@@ -3,37 +3,38 @@
 import gym
 import numpy as np
 import random
-from typing import List
-from definitions import UAV, MIN_SAFE_DISTANCE_MATRIX, UAV_TYPES, UAV_OPTIMAL_SPEED, MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE, DT, R1, R2, R3, H1, H2, MAX_ALTITUDE, TAKEOFF_RING_CAPACITY, LANDING_RING_CAPACITY
-import math
-from vispy import app, scene
-from vispy.scene import visuals
-from vispy.visuals import MeshVisual
-from vispy.color import get_colormap
-import time
+from typing import List, Optional, Dict
+from definitions import (
+    UAV, MIN_SAFE_DISTANCE_MATRIX, UAV_TYPES, UAV_OPTIMAL_SPEED,
+    MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE, DT, R1, R2, R3,
+    H1, H2, MAX_ALTITUDE, TAKEOFF_RING_CAPACITY, LANDING_RING_CAPACITY
+)
+import plotly.graph_objs as go
+import plotly.offline as pyo
+
 
 class UrbanUAVEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(self):
         super(UrbanUAVEnv, self).__init__()
-        self.num_drones = 5  # 调整为所需的无人机数量
+        self.num_drones = 5  # 无人机数量
         self.drones = []
         self.time_step = 0
         self.max_time_steps = 200
 
-        # 定义动作空间为连续空间
+        # 动作和观测空间定义
         action_dim = 3  # [delta_speed, delta_turn, delta_climb]
         self.action_space = gym.spaces.Box(
             low=np.array([-MAX_ACCELERATION, -MAX_TURN_RATE, -MAX_CLIMB_RATE]),
             high=np.array([MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE]),
+            shape=(action_dim,),
             dtype=np.float32
         )
 
-        # 定义观测空间
         num_nearest = 3
         self.num_nearest = num_nearest
-        state_dim = 10 + num_nearest * 6  # [原来的13维 + 邻居信息]
+        state_dim = 10 + num_nearest * 6  # 调整后的计算
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -50,20 +51,21 @@ class UrbanUAVEnv(gym.Env):
         self.airspace_radius = self.R3
         self.approach_area_radius = self.R2
 
-        # 起飞和降落区域（四个关于原点对称的圆形区域）
-        self.takeoff_areas = [
-            {'center': np.array([-R1, -R1, 0.0]), 'radius': R1 / 2},
-            {'center': np.array([R1, -R1, 0.0]), 'radius': R1 / 2},
-            {'center': np.array([-R1, R1, 0.0]), 'radius': R1 / 2},
-            {'center': np.array([R1, R1, 0.0]), 'radius': R1 / 2},
+        # 起飞和降落停机坪（分别两个），内切于起飞/降落环，关于原点对称分布
+        # 起飞停机坪
+        self.takeoff_pads = [
+            {'center': np.array([-R1 / 2, 0.0, 0.0]), 'radius': R1 / 4},
+            {'center': np.array([R1 / 2, 0.0, 0.0]), 'radius': R1 / 4},
         ]
 
-        self.landing_areas = [
-            {'center': np.array([-R1, 0.0, 0.0]), 'radius': R1 / 2},
-            {'center': np.array([R1, 0.0, 0.0]), 'radius': R1 / 2},
-            {'center': np.array([0.0, -R1, 0.0]), 'radius': R1 / 2},
-            {'center': np.array([0.0, R1, 0.0]), 'radius': R1 / 2},
+        # 降落停机坪
+        self.landing_pads = [
+            {'center': np.array([0.0, -R1 / 2, 0.0]), 'radius': R1 / 4},
+            {'center': np.array([0.0, R1 / 2, 0.0]), 'radius': R1 / 4},
         ]
+
+        # 进近区域中心（与原点重合）
+        self.approach_area_center = np.array([0.0, 0.0, 0.0])
 
         # 环和中心
         self.takeoff_ring_center = np.array([0.0, 0.0, self.H1])
@@ -81,44 +83,12 @@ class UrbanUAVEnv(gym.Env):
         self.takeoff_ring_uavs: List[UAV] = []
         self.landing_ring_uavs: List[UAV] = []
 
+        # 可视化设置
+        self.fig = None  # Plotly 图表对象
+        self.episode_data = []  # 存储每个时间步的无人机位置信息
+
+        # 初始化环境
         self.reset()
-
-        # 初始化 VisPy 画布
-        self.canvas = scene.SceneCanvas(keys='interactive', show=True, bgcolor='white')
-        self.view = self.canvas.central_widget.add_view()
-        self.view.camera = scene.cameras.TurntableCamera(elevation=30, azimuth=30)
-        self.view.camera.fov = 60
-        self.view.camera.distance = self.R3 * 2.0
-
-        # 添加标记器用于无人机
-        self.markers = visuals.Markers()
-        self.view.add(self.markers)
-
-        # 添加轨迹线
-        self.traces = []
-        for _ in range(self.num_drones):
-            line = visuals.Line(color='black', width=1)
-            self.view.add(line)
-            self.traces.append(line)
-
-        # 设置颜色映射
-        self.colormap = get_colormap('viridis')
-
-        # 添加起飞环和降落环的可视化
-        self.draw_rings()
-
-        # 添加空域的可视化
-        self.draw_airspace()
-
-        # 添加起飞和降落区域的可视化
-        self.draw_areas()
-
-        # 启动事件循环
-        self.app = app.Application()
-        self.timer = app.Timer(0.1, connect=self.on_timer, start=True)
-
-    def on_timer(self, event):
-        pass  # 需要处理时可以添加逻辑
 
     def reset(self):
         self.drones = []
@@ -129,12 +99,15 @@ class UrbanUAVEnv(gym.Env):
         self.takeoff_ring_uavs = []
         self.landing_ring_uavs = []
 
-        # 只生成执行起飞或降落任务的无人机
+        # 生成执行起飞或降落任务的无人机
         for i in range(self.num_drones):
             task_type = random.choice(['takeoff', 'landing'])
             drone = UAV.random_uav(drone_id=i, task_type=task_type, environment=self)
             if drone:
                 self.drones.append(drone)
+
+        # 重置 episode_data
+        self.episode_data = []
 
         return self._get_observation()
 
@@ -162,8 +135,259 @@ class UrbanUAVEnv(gym.Env):
         # 为每个智能体生成单独的完成状态
         dones = [drone.task_finished or drone.energy <= 0 for drone in self.drones]
 
-        done = False  # 环境的全局完成状态，如果需要可以保持为False
+        # 收集当前时间步的无人机位置信息
+        self.collect_episode_data()
+
+        done = False  # 环境的全局完成状态，如果需要可以保持为 False
         return obs, rewards, dones, infos
+
+    def collect_episode_data(self):
+        # 收集当前时间步的无人机位置信息
+        time_step_data = []
+        for drone in self.drones:
+            time_step_data.append({
+                'drone_id': drone.drone_id,
+                'position': drone.position.copy(),
+                'color': self.get_drone_color(drone)
+            })
+        self.episode_data.append(time_step_data)
+
+    def render_episode(self, episode_num):
+        # 在回合结束时生成动画
+        frames = []
+        drone_ids = [drone.drone_id for drone in self.drones]
+
+        # 为每个无人机初始化轨迹
+        data_dict = {}
+        for drone_id in drone_ids:
+            data_dict[drone_id] = {
+                'x': [],
+                'y': [],
+                'z': [],
+                'color': None
+            }
+
+        # 获取环境可视化元素
+        environment_traces = self.get_environment_traces()
+
+        # 遍历每个时间步的数据，构建动画帧
+        for t, time_step_data in enumerate(self.episode_data):
+            frame_data = []
+            # 添加环境元素
+            frame_data.extend(environment_traces)
+            for drone_data in time_step_data:
+                drone_id = drone_data['drone_id']
+                x, y, z = drone_data['position']
+                color = drone_data['color']
+
+                # 更新轨迹数据
+                data_dict[drone_id]['x'].append(x)
+                data_dict[drone_id]['y'].append(y)
+                data_dict[drone_id]['z'].append(z)
+                data_dict[drone_id]['color'] = color
+
+                # 创建无人机位置的 Scatter3d
+                frame_data.append(go.Scatter3d(
+                    x=[x],
+                    y=[y],
+                    z=[z],
+                    mode='markers',
+                    marker=dict(size=5, color=color),
+                    name=f'Drone {drone_id}'
+                ))
+
+                # 创建无人机轨迹的 Scatter3d
+                frame_data.append(go.Scatter3d(
+                    x=data_dict[drone_id]['x'],
+                    y=data_dict[drone_id]['y'],
+                    z=data_dict[drone_id]['z'],
+                    mode='lines',
+                    line=dict(color=color, width=2),
+                    name=f'Drone {drone_id} Path'
+                ))
+
+            frames.append(go.Frame(data=frame_data, name=str(t)))
+
+        # 创建初始帧
+        initial_data = []
+        # 添加环境元素
+        initial_data.extend(environment_traces)
+        for drone_id in drone_ids:
+            # 无人机初始位置
+            initial_data.append(go.Scatter3d(
+                x=[data_dict[drone_id]['x'][0]],
+                y=[data_dict[drone_id]['y'][0]],
+                z=[data_dict[drone_id]['z'][0]],
+                mode='markers',
+                marker=dict(size=5, color=data_dict[drone_id]['color']),
+                name=f'Drone {drone_id}'
+            ))
+            # 无人机初始轨迹（为空）
+            initial_data.append(go.Scatter3d(
+                x=[],
+                y=[],
+                z=[],
+                mode='lines',
+                line=dict(color=data_dict[drone_id]['color'], width=2),
+                name=f'Drone {drone_id} Path'
+            ))
+
+        # 定义滑块和播放按钮
+        sliders = [dict(
+            steps=[dict(method='animate',
+                        args=[[str(k)],
+                              dict(mode='immediate',
+                                   frame=dict(duration=100, redraw=True),
+                                   transition=dict(duration=0))],
+                        label=str(k)) for k in range(len(frames))],
+            active=0,
+            transition=dict(duration=0),
+            x=0,  # slider 的水平位置
+            y=0,  # slider 的垂直位置
+            currentvalue=dict(font=dict(size=12), prefix='Time Step: ', visible=True, xanchor='center'),
+            len=1.0  # slider 的长度
+        )]
+
+        updatemenus = [dict(type='buttons',
+                            buttons=[dict(label='Play',
+                                          method='animate',
+                                          args=[None,
+                                                dict(frame=dict(duration=100, redraw=True),
+                                                     transition=dict(duration=0),
+                                                     fromcurrent=True,
+                                                     mode='immediate')])],
+                            direction='left',
+                            pad=dict(r=10, t=85),
+                            showactive=False,
+                            x=0.1,
+                            y=0,
+                            xanchor='right',
+                            yanchor='top')]
+
+        # 创建 Figure
+        self.fig = go.Figure(data=initial_data, frames=frames)
+
+        # 更新布局
+        self.fig.update_layout(
+            scene=dict(
+                xaxis=dict(nticks=10, range=[-self.R3, self.R3]),
+                yaxis=dict(nticks=10, range=[-self.R3, self.R3]),
+                zaxis=dict(nticks=10, range=[0, MAX_ALTITUDE]),
+                aspectratio=dict(x=1, y=1, z=0.5)
+            ),
+            width=800,
+            height=600,
+            title=f'Urban UAV Environment - Episode {episode_num} Animation',
+            updatemenus=updatemenus,
+            sliders=sliders
+        )
+
+        # 显示动画
+        pyo.plot(self.fig, filename=f'uav_episode_{episode_num}_animation.html', auto_open=True)
+
+    def get_environment_traces(self):
+        # 生成环境元素的可视化轨迹（空域、进近区域、停机坪、环等）
+        traces = []
+
+        # 定义角度数组
+        theta = np.linspace(0, 2 * np.pi, 100)
+
+        # 最外部的圆柱空域（在 z=0 平面上表示为圆）
+        x = self.R3 * np.cos(theta)
+        y = self.R3 * np.sin(theta)
+        z = np.zeros_like(x)
+        traces.append(go.Scatter3d(
+            x=x,
+            y=y,
+            z=z,
+            mode='lines',
+            line=dict(color='gray', width=2),
+            name='Outer Airspace'
+        ))
+
+        # 内部进近区域
+        x = self.R2 * np.cos(theta)
+        y = self.R2 * np.sin(theta)
+        z = np.zeros_like(x)
+        traces.append(go.Scatter3d(
+            x=x,
+            y=y,
+            z=z,
+            mode='lines',
+            line=dict(color='orange', width=2),
+            name='Approach Area'
+        ))
+
+        # 起飞停机坪
+        for pad in self.takeoff_pads:
+            center = pad['center']
+            radius = pad['radius']
+            x = center[0] + radius * np.cos(theta)
+            y = center[1] + radius * np.sin(theta)
+            z = np.full_like(x, center[2])
+            traces.append(go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name='Takeoff Pad'
+            ))
+
+        # 降落停机坪
+        for pad in self.landing_pads:
+            center = pad['center']
+            radius = pad['radius']
+            x = center[0] + radius * np.cos(theta)
+            y = center[1] + radius * np.sin(theta)
+            z = np.full_like(x, center[2])
+            traces.append(go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode='lines',
+                line=dict(color='green', width=2),
+                name='Landing Pad'
+            ))
+
+        # 起飞环
+        x = self.takeoff_ring_center[0] + self.R1 * np.cos(theta)
+        y = self.takeoff_ring_center[1] + self.R1 * np.sin(theta)
+        z = np.full_like(x, self.H1)
+        traces.append(go.Scatter3d(
+            x=x,
+            y=y,
+            z=z,
+            mode='lines',
+            line=dict(color='blue', width=2),
+            name='Takeoff Ring'
+        ))
+
+        # 降落环
+        x = self.landing_ring_center[0] + self.R1 * np.cos(theta)
+        y = self.landing_ring_center[1] + self.R1 * np.sin(theta)
+        z = np.full_like(x, self.H2)
+        traces.append(go.Scatter3d(
+            x=x,
+            y=y,
+            z=z,
+            mode='lines',
+            line=dict(color='green', width=2),
+            name='Landing Ring'
+        ))
+
+        return traces
+
+    def get_drone_color(self, drone):
+        if drone.task_type == 'takeoff':
+            return 'cyan'  # 青色表示起飞无人机
+        elif drone.task_type == 'landing':
+            if drone.emergency:
+                return 'red'  # 红色表示紧急无人机
+            else:
+                return 'magenta'  # 品红色表示降落无人机
+        else:
+            return 'gray'  # 灰色
 
     def _apply_collision_avoidance(self):
         # 在这里实现避撞逻辑
@@ -285,12 +509,12 @@ class UrbanUAVEnv(gym.Env):
         return True  # 这里不再限制降落停机坪，可直接降落在降落区域内
 
     def get_landing_point(self, drone: UAV):
-        # 在降落区域内随机选择一个点
-        area = random.choice(self.landing_areas)
+        # 在降落停机坪内随机选择一个点
+        pad = random.choice(self.landing_pads)
         angle = random.uniform(0, 2 * np.pi)
-        radius = random.uniform(0, area['radius'])
-        x = area['center'][0] + radius * np.cos(angle)
-        y = area['center'][1] + radius * np.sin(angle)
+        radius = random.uniform(0, pad['radius'])
+        x = pad['center'][0] + radius * np.cos(angle)
+        y = pad['center'][1] + radius * np.sin(angle)
         z = 0.0
         return np.array([x, y, z])
 
@@ -304,8 +528,8 @@ class UrbanUAVEnv(gym.Env):
     def set_emergency_uav_exists(self, exists: bool):
         self.emergency_uav_exists = exists
 
-    def approach_area_center(self):
-        return np.array([0.0, 0.0, self.H2])
+    def get_approach_area_center(self):
+        return self.approach_area_center
 
     def add_to_approach_queue(self, drone: UAV):
         # 紧急无人机插入队列最前面
@@ -314,91 +538,8 @@ class UrbanUAVEnv(gym.Env):
             drone.priority = 999  # 紧急无人机最高优先级
         else:
             self.approach_queue.append(drone)
-            # 优先级根据进入进近空域的时间分配，进入越早，优先级越高
+            # 优先级根据进入进近空域的时间分配，进入越早，值越大
             drone.priority = -drone.entered_approach_time  # 时间越小，值越大
 
-    def draw_rings(self):
-        # 绘制起飞环
-        theta = np.linspace(0, 2 * np.pi, 100)
-        x = self.takeoff_ring_center[0] + self.R1 * np.cos(theta)
-        y = self.takeoff_ring_center[1] + self.R1 * np.sin(theta)
-        z = np.full_like(x, self.H1)
-        takeoff_ring = np.vstack((x, y, z)).T
-        line1 = visuals.Line(pos=takeoff_ring, color='blue', width=2)
-        self.view.add(line1)
-
-        # 绘制降落环
-        x = self.landing_ring_center[0] + self.R1 * np.cos(theta)
-        y = self.landing_ring_center[1] + self.R1 * np.sin(theta)
-        z = np.full_like(x, self.H2)
-        landing_ring = np.vstack((x, y, z)).T
-        line2 = visuals.Line(pos=landing_ring, color='green', width=2)
-        self.view.add(line2)
-
-    def draw_airspace(self):
-        # 绘制外部空域（仅绘制底部圆圈作为参考）
-        theta = np.linspace(0, 2 * np.pi, 100)
-        x = self.airspace_radius * np.cos(theta)
-        y = self.airspace_radius * np.sin(theta)
-        z = np.zeros_like(x)
-        airspace_circle = np.vstack((x, y, z)).T
-        line = visuals.Line(pos=airspace_circle, color='gray', width=1)
-        self.view.add(line)
-
-    def draw_areas(self):
-        # 绘制起飞区域
-        for area in self.takeoff_areas:
-            theta = np.linspace(0, 2 * np.pi, 100)
-            x = area['center'][0] + area['radius'] * np.cos(theta)
-            y = area['center'][1] + area['radius'] * np.sin(theta)
-            z = np.full_like(x, 0.0)
-            pos = np.vstack((x, y, z)).T
-            line = visuals.Line(pos=pos, color='blue', width=1)
-            self.view.add(line)
-
-        # 绘制降落区域
-        for area in self.landing_areas:
-            theta = np.linspace(0, 2 * np.pi, 100)
-            x = area['center'][0] + area['radius'] * np.cos(theta)
-            y = area['center'][1] + area['radius'] * np.sin(theta)
-            z = np.full_like(x, 0.0)
-            pos = np.vstack((x, y, z)).T
-            line = visuals.Line(pos=pos, color='green', width=1)
-            self.view.add(line)
-
-    def render(self, mode='human'):
-        # 准备无人机的位置和颜色
-        positions = []
-        colors = []
-        for drone in self.drones:
-            positions.append(drone.position)
-            if drone.task_type == 'takeoff':
-                colors.append([0, 1, 1, 1])  # 青色
-            elif drone.task_type == 'landing':
-                if drone.emergency:
-                    colors.append([1, 0, 0, 1])  # 红色表示紧急无人机
-                else:
-                    colors.append([1, 0, 1, 1])  # 品红色
-            else:
-                colors.append([0.5, 0.5, 0.5, 1])  # 灰色
-
-        positions = np.array(positions)
-        colors = np.array(colors)
-
-        # 更新无人机标记
-        self.markers.set_data(positions[:, :3], face_color=colors, size=10)
-
-        # 更新轨迹
-        max_trace_length = 100  # 仅绘制最近的100个位置点
-        for idx, drone in enumerate(self.drones):
-            if len(drone.position_history) > 1:
-                trace = np.array(drone.position_history[-max_trace_length:])
-                self.traces[idx].set_data(pos=trace[:, :3], width=1, color='black')  # X, Y, Z
-
-        # 更新画布
-        self.canvas.update()
-        time.sleep(0.01)  # 控制渲染速度
-
     def close(self):
-        if hasattr(self, 'canvas'):
-            self.canvas.close()
+        pass
