@@ -5,8 +5,9 @@ import numpy as np
 import random
 from typing import List, Optional, Dict
 from definitions import (
-    UAV, MIN_SAFE_DISTANCE_MATRIX, UAV_TYPES, UAV_OPTIMAL_SPEED,
-    MAX_ACCELERATION, MAX_TURN_RATE, MAX_CLIMB_RATE, DT, R1, R2, R3,
+    UAV, ALL_UAV_TYPES, ALL_UAV_OPTIMAL_SPEED, ALL_UAV_PERFORMANCE,
+    MIN_SAFE_DISTANCE_MATRIX,
+    DT, R1, R2, R3,
     H1, H2, MAX_ALTITUDE, TAKEOFF_RING_CAPACITY, LANDING_RING_CAPACITY
 )
 import plotly.graph_objs as go
@@ -18,11 +19,14 @@ class UrbanUAVEnv(gym.Env):
 
     def __init__(self):
         super(UrbanUAVEnv, self).__init__()
-        self.num_drones = 5  # 无人机数量
+        self.num_drones = random.randint(10, 30)  # 无人机总数量随机
         self.drones = []
         self.time_step = 0
         self.max_time_steps = 200
-
+        # 在每次仿真中，随机选择无人机类型列表
+        self.UAV_TYPES = random.sample(ALL_UAV_TYPES, random.randint(2, len(ALL_UAV_TYPES)))
+        self.UAV_OPTIMAL_SPEED = {key: ALL_UAV_OPTIMAL_SPEED[key] for key in self.UAV_TYPES}
+        self.UAV_PERFORMANCE = {key: ALL_UAV_PERFORMANCE[key] for key in self.UAV_TYPES}
         # 动作和观测空间定义
         action_dim = 3  # [delta_speed, delta_turn, delta_climb]
         self.action_space = gym.spaces.Box(
