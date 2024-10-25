@@ -450,18 +450,35 @@ class UrbanUAVEnv(gym.Env):
     def _get_observation(self):
         obs = []
         for i, drone in enumerate(self.drones):
-            position = drone.position
-            velocity = drone.speed * drone.heading
-            energy = np.array([drone.energy])
-            type_index = UAV_TYPES.index(drone.type)
-            type_info = np.array([type_index])
-            cooperative_flag = np.array([1.0 if drone.cooperative else 0.0])
-            priority_info = np.array([drone.priority])
+            # 自身状态
+            own_state = np.concatenate([drone.position, drone.velocity, [drone.energy], [drone.type_index],
+                                        [1.0 if drone.cooperative else 0.0], [drone.priority]])
 
-            # 获取最近的邻居信息
-            neighbors_info = self._get_neighbors_info(drone)
-
-            observation = np.concatenate([position, velocity, energy, type_info, cooperative_flag, priority_info, neighbors_info])
+            # 初始化邻居信息列表
+            neighbors_info = []
+            # 获取邻居列表
+            neighbors = self._get_nearest_neighbors(drone, self.num_nearest)
+            for neighbor in neighbors:
+                relative_position = neighbor.position - drone.position
+                relative_velocity = neighbor.velocity - drone.velocity
+                neighbor_cooperative_flag = np.array([1.0 if neighbor.cooperative else 0.0])
+                if drone.cooperative and neighbor.cooperative:
+                    # 可以获取目标信息
+                    target_relative_position = neighbor.target - drone.position
+                    neighbor_info = np.concatenate(
+                        [relative_position, relative_velocity, neighbor_cooperative_flag, target_relative_position])
+                else:
+                    # 无法获取目标信息，用零填充
+                    target_relative_position = np.zeros(3)
+                    neighbor_info = np.concatenate(
+                        [relative_position, relative_velocity, neighbor_cooperative_flag, target_relative_position])
+                neighbors_info.extend(neighbor_info)
+            # 填充不足的邻居信息
+            expected_length = self.num_nearest * (3 + 3 + 1 + 3)  # 每个邻居信息的长度
+            if len(neighbors_info) < expected_length:
+                neighbors_info.extend([0.0] * (expected_length - len(neighbors_info)))
+            # 组合自身状态和邻居信息
+            observation = np.concatenate([own_state, neighbors_info])
             obs.append(observation)
         return obs
 
