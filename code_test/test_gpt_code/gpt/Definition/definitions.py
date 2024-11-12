@@ -4,8 +4,9 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List
 import random
-
-# 常量和参数
+import gym
+import math
+from scipy.stats import burr
 
 # 无人机类型
 ALL_UAV_TYPES = ['multirotor', 'light_hybrid_wing', 'medium_hybrid_wing', 'heavy_hybrid_wing']
@@ -62,8 +63,8 @@ for (type1, type2), distance in list(MIN_SAFE_DISTANCE_MATRIX.items()):
 
 # 空域参数
 R1 = 100.0    # 起飞/降落环的半径（米）
-R2 = 300.0    # 进近区域的半径（米），R2 > R1
-R3 = 3000.0    # 外部空域的半径（米）
+R2 = 1000.0    # 进近区域的半径（米），R2 > R1
+R3 = 5000.0    # 外部空域的半径（米）
 H1 = 150.0    # 起飞环的高度（米）
 H2 = 100.0     # 降落环的高度（米）
 MAX_ALTITUDE = 1500.0   # 空域的最大高度（米）
@@ -73,16 +74,17 @@ LANDING_RING_CAPACITY = 5   # 降落环容量
 
 PAD_COOLDOWN_TIME = 10  # 停机坪冷却时间（秒）
 
+
 @dataclass
 class UAV:
     drone_id: int
-    position: np.ndarray
-    target: Optional[np.ndarray]
     optimal_speed: float
     task_type: str
     cooperative: bool
     type: str  # 无人机类型
     emergency: bool = False  # 是否为紧急无人机
+    position: np.ndarray = field(init=False)
+    target: Optional[np.ndarray] = field(default=None)  # 目标位置
 
     # 飞行参数
     speed: float = field(init=False)
@@ -110,81 +112,143 @@ class UAV:
     avoided_collision: bool = field(default=False, init=False)
     energy_consumption: float = field(default=0.0, init=False)
     priority: int = field(default=0, init=False)  # 避让优先级，数值越高优先级越高
-
-    # 新增属性
     position_history: List[np.ndarray] = field(default_factory=list, init=False)
     entered_approach_time: Optional[int] = field(default=None, init=False)  # 进入进近空域的时间
     assigned_ring_entry_point: Optional[np.ndarray] = field(default=None, init=False)  # 分配的环入口点
     target_point: Optional[np.ndarray] = field(default=None, init=False)  # 最终目标点
+    action_space: gym.spaces.Box = field(init=False)
+    heading_error_scale = 2.0
+    airspeed_error_scale = 1.0
+    max_wind_speed = 10.0  # 最大风速 10 m/s（适用于低空飞行环境）
+    wind_speed_range = 2.0  # 风速波动范围 ±2 m/s
+    reference_wind_heading = random.uniform(0, 2 * math.pi)  # 随机生成风向，单位：弧度 [0, 2π]
+    reference_wind_speed = np.clip(burr.rvs(c=4.089, d=0.814, loc=-0.042, size=1, scale=17.47),
+                                   wind_speed_range, max_wind_speed - wind_speed_range)  # 风速的生成
+    wait_time: int = field(default=0)
+    permission: str = field(default="unrestricted")  # 初始权限为无限制
 
     def __post_init__(self):
-        self.speed = 0.0  # 初始化速度为 0
-        self.heading = np.array([0.0, 0.0, 0.0])
-        self.heading_angle = 0.0
+        # 设置初始位置
+        self.position = np.zeros(3) if self.position is None else self.position
         self.altitude = self.position[2].item()
         self.energy = 100.0  # 初始能量
         self.path_length = 0.0
-        self.environment = None  # 将在环境中设置
-        # 初始化位置历史
+        self.environment = None
         self.position_history.append(self.position.copy())
 
-        # 根据无人机类型设置性能参数
-        performance = self.environment.UAV_PERFORMANCE[self.type]
+        # 选择无人机类型
+        uav_type = self.type
+        self.optimal_speed = ALL_UAV_OPTIMAL_SPEED[uav_type]
+        performance = ALL_UAV_PERFORMANCE[uav_type]
         self.max_acceleration = performance['max_acceleration']
         self.max_turn_rate = performance['max_turn_rate']
         self.max_climb_rate = performance['max_climb_rate']
 
-        # 根据任务类型设置目标位置
+        # 根据任务类型设置初始位置和目标位置
         if self.task_type == 'takeoff':
-            # 起飞无人机的目标是飞出空域
-            theta = np.random.uniform(0, 2 * np.pi)
-            x_outer = self.environment.airspace_radius * np.cos(theta)
-            y_outer = self.environment.airspace_radius * np.sin(theta)
-            z_outer = np.random.uniform(0, MAX_ALTITUDE)
-            self.target = np.array([x_outer, y_outer, z_outer])
+            self.position = np.array([0, 0, H1])  # 起飞环中心
+            theta_target = np.random.uniform(0, 2 * np.pi)
+            self.target = np.array(
+                [R3 * np.cos(theta_target), R3 * np.sin(theta_target), np.random.uniform(0, MAX_ALTITUDE)])
+            self.speed = 0.0
+            self.heading = self.calculate_direction()
+            self.heading_angle = self.bearing
         elif self.task_type == 'landing':
-            # 降落无人机的目标是降落区域中心
-            self.target = self.environment.get_landing_port_center()
+            theta = np.random.uniform(0, 2 * np.pi)
+            self.position = np.array([R3 * np.cos(theta), R3 * np.sin(theta), np.random.uniform(H2, MAX_ALTITUDE)])
+            self.target = np.array([0.0, 0.0, H2])  # 降落环中心
+            self.speed = self.optimal_speed
+            self.heading = self.calculate_direction()
+            self.heading_angle = self.bearing
+
+        # 初始化动作空间
+        self.action_space = gym.spaces.Box(
+            low=np.array([-self.max_acceleration * DT, -self.max_turn_rate * DT, -self.max_climb_rate * DT]),
+            high=np.array([self.max_acceleration * DT, self.max_turn_rate * DT, self.max_climb_rate * DT]),
+            dtype=np.float32,
+            shape=(3,)
+        )
 
     def calculate_direction(self) -> np.ndarray:
         direction = self.target - self.position
         norm = np.linalg.norm(direction[:2])
         return direction / norm if norm != 0 else np.array([0.0, 0.0, 0.0])
 
+    @property
+    def bearing(self) -> float:
+        """
+        Bearing from current position to target
+        :return:
+        """
+        dx = self.target[0] - self.position[0]
+        dy = self.target[1] - self.position[1]
+        compass = math.atan2(dy, dx)
+        return (compass + 2 * math.pi) % math.pi
+
     def step(self, action: np.ndarray, other_drones: List['UAV']):
-        # 动作限制根据无人机的性能参数
-        delta_speed = np.clip(action[0], -self.max_acceleration * DT, self.max_acceleration * DT)
-        delta_turn = np.clip(action[1], -self.max_turn_rate * DT, self.max_turn_rate * DT)
-        delta_climb = np.clip(action[2], -self.max_climb_rate * DT, self.max_climb_rate * DT)
-        # 更新无人机速度
-        self.speed = np.clip(self.speed + delta_speed, 0.0, self.optimal_speed * 1.5)  # 限制最大速度
-        # 更新无人机航向角
+
+        # Uncertainty: Adding random heading error (航向误差)
+        heading_error = np.random.normal(0, self.heading_error_scale)  # 生成航向误差
+        speed_error = np.random.normal(0, self.airspeed_error_scale)  # 生成速度误差
+
+        # 限制速度更新
+        delta_speed = action[0]  # 控制加速度
+        self.speed = np.clip(self.speed + delta_speed + speed_error, 0.0,
+                             self.optimal_speed * 1.5).item()  # 更新速度并限制最大速度
+
+        # 更新航向角，并限制最大转向角
+        delta_turn = np.clip(action[1] + heading_error, -self.max_turn_rate * DT, self.max_turn_rate * DT)  # 限制航向变化速率
         self.heading_angle += delta_turn
-        self.heading_angle = self.heading_angle % 360  # 保持在 [0, 360) 范围内
-        # 更新无人机高度
-        self.altitude = np.clip(self.altitude + delta_climb, 0.0, MAX_ALTITUDE)
-        # 根据新的航向和速度更新位置
+        self.heading_angle = self.heading_angle % 360  # 保持航向角在 [0, 360) 范围内
+
+        # 更新高度
+        delta_climb = np.clip(action[2], -self.max_climb_rate * DT, self.max_climb_rate * DT)  # 限制爬升速率
+        self.altitude = np.clip(self.altitude + delta_climb, 0.0, MAX_ALTITUDE).item()  # 更新高度并限制最大高度
+
+        # 计算新的航向
         self.heading = np.array([
             np.cos(np.deg2rad(self.heading_angle)),
             np.sin(np.deg2rad(self.heading_angle)),
             0.0
         ])
-        self.position += self.speed * self.heading * DT
-        self.position[2] = self.altitude
-        # 能量消耗和路径长度更新
+
+        # **风速对位置的影响**（风速误差）
+        wind_heading = self.reference_wind_heading
+        wind_speed = self.reference_wind_speed + np.clip(np.random.normal(0, 1), -1,
+                                                         1) * self.wind_speed_range  # 生成风速误差
+        wind_dx = math.cos(wind_heading) * wind_speed
+        wind_dy = math.sin(wind_heading) * wind_speed
+
+        # 更新位置：将风速和无人机速度一起考虑
+        self.position += (self.speed * self.heading[:2] + np.array([wind_dx, wind_dy])) * DT  # 风速对位置的影响
+        self.position[2] = self.altitude  # 更新高度
+
+        # 能量消耗更新，调用能量消耗计算函数
         self.energy_consumption += self.compute_energy_consumption(delta_speed, delta_turn, delta_climb)
-        self.path_length += self.speed * DT
+
+        # 更新路径长度
+        self.path_length += np.linalg.norm(self.speed * self.heading[:2] * DT + np.array([wind_dx, wind_dy]) * DT)
+
         # 更新位置历史
         self.position_history.append(self.position.copy())
-        # 检查是否完成任务
+
+        # 检查任务状态（如是否完成任务）
         self.check_task_status()
-        # 检查违规
+
+        # 检查是否有违规行为（如进入禁止区域、与其他无人机发生冲突等）
         self.check_violation()
+
+        # 碰撞检测和避免（如果有多个无人机的环境）
+        self.avoid_collisions(other_drones)
+
+        # 返回新的状态
+        return self.position, self.speed, self.heading_angle, self.energy_consumption, self.path_length, self.task_finished
 
     def check_violation(self):
         # 检查是否超出空域边界
-        if np.linalg.norm(self.position[:2]) > self.environment.airspace_radius:
-            self.violation = True
+        if self.environment and hasattr(self.environment, 'airspace_radius'):
+            if np.linalg.norm(self.position[:2]) > self.environment.airspace_radius:
+                self.violation = True
 
     def compute_energy_consumption(self, delta_speed, delta_heading, delta_altitude):
         """
@@ -195,11 +259,22 @@ class UAV:
         return energy
 
     def check_task_status(self):
-        # 根据任务类型检查任务状态
         if self.task_type == 'takeoff':
-            self.handle_takeoff_task()
+            # 判断是否离开空域
+            if np.linalg.norm(self.position[:2]) > self.environment.airspace_radius:
+                self.task_finished = True
+                # 起飞环进入冷却
+                self.environment.takeoff_ring_available = False
+                self.environment.takeoff_cooldown = PAD_COOLDOWN_TIME
+
         elif self.task_type == 'landing':
-            self.handle_landing_task()
+            # 判断是否到达降落环的 XY 平面区域
+            distance_to_target_xy = np.linalg.norm(self.position[:2] - self.target[:2])
+            if distance_to_target_xy < 5.0:  # 允许的误差范围
+                self.task_finished = True
+                # 降落环进入冷却
+                self.environment.landing_ring_available = False
+                self.environment.landing_cooldown = PAD_COOLDOWN_TIME
 
     def handle_takeoff_task(self):
         if not self.taking_off:
@@ -339,7 +414,7 @@ class UAV:
     @classmethod
     def random_uav(cls, drone_id: int, task_type: str, environment):
         cooperative = random.choice([True, False])
-        uav_type = random.choice(ALL_UAV_TYPES)
+        uav_type = random.choice(environment.UAV_TYPES)
         optimal_speed = ALL_UAV_OPTIMAL_SPEED[uav_type]
 
         # 确定是否为紧急无人机
